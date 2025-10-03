@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "encrypted-blob-server"
+dynamic = ["version"]
+description = ''
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = []
+authors = [
+  { name = "Ron M", email = "ramayer+git@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = []
+
+[project.urls]
+Documentation = "https://github.com/Ron M/encrypted-blob-server#readme"
+Issues = "https://github.com/Ron M/encrypted-blob-server/issues"
+Source = "https://github.com/Ron M/encrypted-blob-server"
+
+[tool.hatch.version]
+path = "src/encrypted_blob_server/__about__.py"
+
+[tool.hatch.envs.types]
+extra-dependencies = [
+  "mypy>=1.0.0",
+]
+[tool.hatch.envs.types.scripts]
+check = "mypy --install-types --non-interactive {args:src/encrypted_blob_server tests}"
+
+[tool.coverage.run]
+source_pkgs = ["encrypted_blob_server", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/encrypted_blob_server/__about__.py",
+]
+
+[tool.coverage.paths]
+encrypted_blob_server = ["src/encrypted_blob_server", "*/encrypted-blob-server/src/encrypted_blob_server"]
+tests = ["tests", "*/encrypted-blob-server/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
