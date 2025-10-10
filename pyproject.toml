@@ -33,6 +33,9 @@ Documentation = "https://github.com/Ron M/encrypted-blob-server#readme"
 Issues = "https://github.com/Ron M/encrypted-blob-server/issues"
 Source = "https://github.com/Ron M/encrypted-blob-server"
 
+[project.scripts]
+encrypted_blob_server = "encrypted_blob_server.app:main"
+
 [tool.hatch.version]
 path = "src/encrypted_blob_server/__about__.py"
 

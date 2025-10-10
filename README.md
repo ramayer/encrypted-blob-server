@@ -1,21 +1,206 @@
-# encrypted_blob_server
+# Encrypted Blob Server
 
-[![PyPI - Version](https://img.shields.io/pypi/v/encrypted-blob-server.svg)](https://pypi.org/project/encrypted-blob-server)
-[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/encrypted-blob-server.svg)](https://pypi.org/project/encrypted-blob-server)
+A tiny, minimal HTTP server that stores **encrypted blobs** in SQLite and decrypts them on the fly.
 
------
+**Main benefits**
 
-## Table of Contents
+* **Encrypted storage** — no password or global key is stored server-side. Blobs are encrypted using a key derived from the password supplied by the client. If disk is stolen, data at rest remains encrypted.
+* **Password‑scoped content** — the same URL path can map to different decrypted content for different passwords. This lets multiple users share the same URLs but see different content (or lets a single user host multiple sites from the same server by switching passwords).
+* **No complex signup** — the password itself is the namespace: set the password via HTTP Basic Auth (or cookie) and the server uses that to encrypt/decrypt.
 
-- [Installation](#installation)
-- [License](#license)
+---
 
-## Installation
+## Quick summary
 
-```console
-pip install encrypted-blob-server
-```
+* Upload: `PUT /path/to/blob` with `Content-Type` and the body. The request must provide credentials (cookie `password` or HTTP Basic auth). The blob is encrypted and stored in SQLite.
+* Download: `GET /path/to/blob` with the same credentials decrypts and returns the blob. Supports `Range` requests so `<video>` elements and seeking work.
+* The server accepts Basic auth and will set a `password` cookie so browsers don't repeatedly prompt. CLI clients (curl) can use `-u ":password"` or `-b cookies.txt`.
+
+---
+
+## Files in this repo
+
+* `app.py` — the minimal Flask application (main server).
+* `start.sh` — entrypoint used by the Docker image to start the app, generate the mitmproxy CA, seed the CA and setup HTML as blobs, and launch mitmproxy as TLS reverse proxy.
+* `Dockerfile` — builds an image that installs the package from GitHub and `mitmproxy`, and runs the `start.sh`.
+* `pyproject.toml` — packaging config (Hatch + minimal deps).
+
+---
 
 ## License
 
-`encrypted-blob-server` is distributed under the terms of the [MIT](https://spdx.org/licenses/MIT.html) license.
+## ⚖️ License -- likely no traditional license or copyright applies
+
+This project was created almost entirely by a handful of large language models.
+The human contribution was minimal and mostly evaluative: initiating the idea, requesting papers, and describing qualitative behavior of the software.
+
+As a result, there may be **no copyright ownership** in the traditional legal sense — most jurisdictions require meaningful human authorship to grant copyright.
+
+Accordingly:
+
+* ⚠️ No copyright is claimed.
+* ✅ To the fullest extent allowed by law, this work is **dedicated to the public domain**.
+* 🌍 Where a legal dedication is required, this repository is released under [CC0 1.0 Universal (Public Domain Dedication)](https://creativecommons.org/publicdomain/zero/1.0/).
+
+You are free to **use, modify, copy, and redistribute** this project for any purpose, without restriction.
+
+---
+
+## Running locally from `pip install` (without HTTPS)
+
+> This mode runs the Flask app on HTTP only (no TLS). It's useful for local dev and quick tests.
+
+1. Install the package (if published) or run from local source. If your package is already on GitHub as the example, you can install it like:
+
+```bash
+pip install git+https://github.com/ramayer/encrypted-blob-server@v0.9.0-rc1
+```
+
+2. Run the app (it exposes port `5000` by default):
+
+```bash
+encrypted-blob-server
+# or
+python -m blobserver.app
+```
+
+3. Use the server with `curl` via Basic Auth (server sets the cookie for convenience):
+
+* Upload a file (example: small HTML page):
+
+```bash
+curl -u ":mysecret" -c cookies.txt -d "" http://127.0.0.1:5000/   # bootstrap cookie
+curl -b cookies.txt -X PUT -H "Content-Type: text/html" --data-binary @my-page.html http://127.0.0.1:5000/
+```
+
+* Download the file (same password):
+
+```bash
+curl -b cookies.txt http://127.0.0.1:5000/ -o index.html
+```
+
+* Upload a binary (image):
+
+```bash
+curl -u ":pass1" -c cookies1.txt -d "" http://127.0.0.1:5000/  # bootstrap cookie for pass1
+curl -b cookies1.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat1.jpg http://127.0.0.1:5000/img/cat.jpg
+```
+
+* Upload a second image to the *same* path but under a *different* password:
+
+```bash
+curl -u ":pass2" -c cookies2.txt -d "" http://127.0.0.1:5000/  # bootstrap cookie for pass2
+curl -b cookies2.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat2.jpg http://127.0.0.1:5000/img/cat.jpg
+```
+
+Now, fetching `/img/cat.jpg` with `pass1` will return `cat1.jpg` and fetching it with `pass2` will return `cat2.jpg` — same URL, different content.
+
+---
+
+## Running with Docker (HTTPS via mitmproxy)
+
+The Docker image in this repo runs the Flask app behind **mitmproxy** which generates a local CA and serves HTTPS (reverse proxy) on port `8443`. The container's `start.sh` seeds two blobs on first run:
+
+* `/` — a small HTML page explaining installation of the CA
+* `/encrypted-blob-server-ca-cert.pem` — the mitmproxy CA PEM
+
+Both of these are uploaded into the server as ordinary encrypted blobs under the special password `setup`.
+
+**Run the container**
+
+```bash
+mkdir -p ~/encblob-mitm
+docker build -t encblob:mitm .
+docker run --rm -it -v ~/encblob-mitm:/root/.mitmproxy -p 8443:8443 --name encblob-dev encblob:mitm
+```
+
+**Install the CA into your browser**
+
+Once the container has generated the CA, the file will be available on the host at `~/encblob-mitm/mitmproxy-ca-cert.pem`.
+
+* For **Firefox**: Preferences → Privacy & Security → View Certificates → Authorities → Import → choose `mitmproxy-ca-cert.pem` and trust it for website identification.
+* For **Chrome on macOS**: open Keychain Access → Import the PEM → find the cert → set "Always Trust" for SSL → restart Chrome.
+
+You can also download the CA from the server (it's stored as a normal blob) after bootstrapping the `setup` cookie via Basic Auth:
+
+```bash
+# bootstrap cookie with Basic auth against the upstream HTTP (the start.sh also does this during startup)
+curl -u ":setup" -c cookies.txt -d "" http://127.0.0.1:5000/
+# download CA via HTTPS using the just-installed CA file for verification
+curl -b cookies.txt --cacert ~/encblob-mitm/mitmproxy-ca-cert.pem https://localhost:8443/encrypted-blob-server-ca-cert.pem -o mitmproxy-ca-cert.pem
+```
+
+**Open the setup page in your browser**
+
+After installing the CA into your browser trust store, you can open:
+
+```
+https://localhost:8443/
+```
+
+and the browser should trust the dynamically generated certs mitmproxy serves for `localhost`.
+
+> Security reminder: only install the generated development CA on machines you control. Remove it when you're done.
+
+---
+
+## Example: Upload an HTML page and two different cat images (same path, different passwords)
+
+This demonstrates the password-scoped nature of the store.
+
+1. **Generate or download example images**
+
+You can use an image placeholder service or grab local images. Example using `placekitten.com` (or replace with your own images):
+
+```bash
+curl -o cat1.jpg https://placekitten.com/800/600
+curl -o cat2.jpg https://placekitten.com/801/600
+```
+
+2. **Upload cat1.jpg under password `pass1`**
+
+```bash
+curl -u ":pass1" -c cookies1.txt -d "" http://127.0.0.1:5000/
+curl -b cookies1.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat1.jpg http://127.0.0.1:5000/img/cat.jpg
+```
+
+3. **Upload cat2.jpg under password `pass2`**
+
+```bash
+curl -u ":pass2" -c cookies2.txt -d "" http://127.0.0.1:5000/
+curl -b cookies2.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat2.jpg http://127.0.0.1:5000/img/cat.jpg
+```
+
+4. **Fetch with `pass1` and `pass2` to confirm different content**
+
+```bash
+curl -b cookies1.txt http://127.0.0.1:5000/img/cat.jpg -o seen-by-pass1.jpg
+curl -b cookies2.txt http://127.0.0.1:5000/img/cat.jpg -o seen-by-pass2.jpg
+# compare file sizes or visually open them
+ls -l seen-by-pass1.jpg seen-by-pass2.jpg
+```
+
+If you run the same steps against the Docker HTTPS server, use `https://localhost:8443/` and `--cacert ~/encblob-mitm/mitmproxy-ca-cert.pem` for curl verification.
+
+---
+
+## Notes & operational tips
+
+* **Persistence**: mount a host dir for the mitmproxy CA: `-v ~/encblob-mitm:/root/.mitmproxy` and optionally mount a host dir for the SQLite DB if you want data to survive container recreation.
+* **Cache behaviour**: the server caches decrypted blobs in an LRU cache to speed repeated reads. The cache is cleared globally on writes.
+* **Large files**: the server decrypts the entire blob and then slices ranges. This is simple and works for typical media sizes — if you need streaming multi-GB files you should switch to chunked storage.
+* **Production**: don't use mitmproxy or generated CAs in production. Use a proper TLS certificate from a trusted CA or an internal PKI you control.
+
+---
+
+## Contributing
+
+Patches and improvements welcome. If you make changes, please include tests for any crypto or storage changes — accidental incompatibilities will make old blobs undecryptable.
+
+---
+
+## Contact
+
+If you fork or maintain your own version of this, please update the README and license block to reflect your changes.
+
+Enjoy!
