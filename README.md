@@ -6,15 +6,16 @@ A tiny, minimal HTTP server that stores **encrypted blobs** in SQLite and decryp
 
 * **Encrypted storage** — no password or global key is stored server-side. Blobs are encrypted using a key derived from the password supplied by the client. If disk is stolen, data at rest remains encrypted.
 * **Password‑scoped content** — the same URL path can map to different decrypted content for different passwords. This lets multiple users share the same URLs but see different content (or lets a single user host multiple sites from the same server by switching passwords).
-* **No complex signup** — the password itself is the namespace: set the password via HTTP Basic Auth (or cookie) and the server uses that to encrypt/decrypt.
+* **No complex signup** — the password itself is the namespace: set the password via the `/_/login` endpoint and the server uses that to encrypt/decrypt.
 
 ---
 
 ## Quick summary
 
-* Upload: `PUT /path/to/blob` with `Content-Type` and the body. The request must provide credentials (cookie `password` or HTTP Basic auth). The blob is encrypted and stored in SQLite.
-* Download: `GET /path/to/blob` with the same credentials decrypts and returns the blob. Supports `Range` requests so `<video>` elements and seeking work.
-* The server accepts Basic auth and will set a `password` cookie so browsers don't repeatedly prompt. CLI clients (curl) can use `-u ":password"` or `-b cookies.txt`.
+* Login: `POST /_/login` with `username` and `password` form fields. The server derives a session token and sets a secure session cookie.
+* Upload: `PUT /path/to/blob` with `Content-Type` and the body. Requires an active session (login first). The blob is encrypted and stored in SQLite.
+* Download: `GET /path/to/blob` with the same session decrypts and returns the blob. Supports `Range` requests so `<video>` elements and seeking work.
+* Logout: `GET /_/logout` clears the session cookie.
 
 ---
 
@@ -62,18 +63,25 @@ pip install git+https://github.com/ramayer/encrypted-blob-server@v0.9.0-rc1
 encrypted-blob-server
 # or
 python -m blobserver.app
+# or 
+uv run encrypted-blob-server
 ```
 
-3. Use the server with `curl` via Basic Auth (server sets the cookie for convenience):
+3. Use the server with `curl`:
+
+* Login first:
+
+```bash
+curl -c cookies.txt -d 'username=alice&password=mysecret' http://127.0.0.1:5000/_/login
+```
 
 * Upload a file (example: small HTML page):
 
 ```bash
-curl -u ":mysecret" -c cookies.txt -d "" http://127.0.0.1:5000/   # bootstrap cookie
 curl -b cookies.txt -X PUT -H "Content-Type: text/html" --data-binary @my-page.html http://127.0.0.1:5000/
 ```
 
-* Download the file (same password):
+* Download the file (same session):
 
 ```bash
 curl -b cookies.txt http://127.0.0.1:5000/ -o index.html
@@ -82,18 +90,18 @@ curl -b cookies.txt http://127.0.0.1:5000/ -o index.html
 * Upload a binary (image):
 
 ```bash
-curl -u ":pass1" -c cookies1.txt -d "" http://127.0.0.1:5000/  # bootstrap cookie for pass1
+curl -c cookies1.txt -d 'username=alice&password=pass1' http://127.0.0.1:5000/_/login
 curl -b cookies1.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat1.jpg http://127.0.0.1:5000/img/cat.jpg
 ```
 
 * Upload a second image to the *same* path but under a *different* password:
 
 ```bash
-curl -u ":pass2" -c cookies2.txt -d "" http://127.0.0.1:5000/  # bootstrap cookie for pass2
+curl -c cookies2.txt -d 'username=alice&password=pass2' http://127.0.0.1:5000/_/login
 curl -b cookies2.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat2.jpg http://127.0.0.1:5000/img/cat.jpg
 ```
 
-Now, fetching `/img/cat.jpg` with `pass1` will return `cat1.jpg` and fetching it with `pass2` will return `cat2.jpg` — same URL, different content.
+Now, fetching `/img/cat.jpg` with the `pass1` session will return `cat1.jpg` and fetching it with the `pass2` session will return `cat2.jpg` — same URL, different content.
 
 ---
 
@@ -104,7 +112,7 @@ The Docker image in this repo runs the Flask app behind **mitmproxy** which gene
 * `/` — a small HTML page explaining installation of the CA
 * `/encrypted-blob-server-ca-cert.pem` — the mitmproxy CA PEM
 
-Both of these are uploaded into the server as ordinary encrypted blobs under the special password `setup`.
+Both of these are uploaded into the server under the special password `setup`.
 
 **Run the container**
 
@@ -121,12 +129,10 @@ Once the container has generated the CA, the file will be available on the host 
 * For **Firefox**: Preferences → Privacy & Security → View Certificates → Authorities → Import → choose `mitmproxy-ca-cert.pem` and trust it for website identification.
 * For **Chrome on macOS**: open Keychain Access → Import the PEM → find the cert → set "Always Trust" for SSL → restart Chrome.
 
-You can also download the CA from the server (it's stored as a normal blob) after bootstrapping the `setup` cookie via Basic Auth:
+You can also download the CA from the server (it's stored as a normal blob) after logging in with the `setup` password:
 
 ```bash
-# bootstrap cookie with Basic auth against the upstream HTTP (the start.sh also does this during startup)
-curl -u ":setup" -c cookies.txt -d "" http://127.0.0.1:5000/
-# download CA via HTTPS using the just-installed CA file for verification
+curl -c cookies.txt -d 'username=setup&password=setup' http://127.0.0.1:5000/_/login
 curl -b cookies.txt --cacert ~/encblob-mitm/mitmproxy-ca-cert.pem https://localhost:8443/encrypted-blob-server-ca-cert.pem -o mitmproxy-ca-cert.pem
 ```
 
@@ -135,10 +141,10 @@ curl -b cookies.txt --cacert ~/encblob-mitm/mitmproxy-ca-cert.pem https://localh
 After installing the CA into your browser trust store, you can open:
 
 ```
-https://localhost:8443/
+https://localhost:8443/_/login
 ```
 
-and the browser should trust the dynamically generated certs mitmproxy serves for `localhost`.
+and log in with username `setup` and password `setup` to access the setup page.
 
 > Security reminder: only install the generated development CA on machines you control. Remove it when you're done.
 
@@ -160,14 +166,14 @@ curl -o cat2.jpg https://placekitten.com/801/600
 2. **Upload cat1.jpg under password `pass1`**
 
 ```bash
-curl -u ":pass1" -c cookies1.txt -d "" http://127.0.0.1:5000/
+curl -c cookies1.txt -d 'username=alice&password=pass1' http://127.0.0.1:5000/_/login
 curl -b cookies1.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat1.jpg http://127.0.0.1:5000/img/cat.jpg
 ```
 
 3. **Upload cat2.jpg under password `pass2`**
 
 ```bash
-curl -u ":pass2" -c cookies2.txt -d "" http://127.0.0.1:5000/
+curl -c cookies2.txt -d 'username=alice&password=pass2' http://127.0.0.1:5000/_/login
 curl -b cookies2.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat2.jpg http://127.0.0.1:5000/img/cat.jpg
 ```
 
@@ -204,3 +210,4 @@ Patches and improvements welcome. If you make changes, please include tests for 
 If you fork or maintain your own version of this, please update the README and license block to reflect your changes.
 
 Enjoy!
+

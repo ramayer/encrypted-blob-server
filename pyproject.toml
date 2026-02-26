@@ -1,62 +1,27 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "encrypted-blob-server"
-dynamic = ["version"]
-description = ''
+version = "0.1.0"
+description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-#license = "MIT" # CC0 is closest
-keywords = []
-authors = [
-  { name = "Ron M", email = "ramayer+git@gmail.com" },
-]
-classifiers = [
-  "Development Status :: 4 - Beta",
-  "Programming Language :: Python",
-]
 dependencies = [
-    "flask>=3.1",
-    "cryptography>=42.0",
-    "mitmproxy>=12.1",
+    "cryptography>=45.0.7",
+    "flask>=3.1.2",
+    "mitmproxy>=12.1.2",
 ]
-[project.urls]
-Documentation = "https://github.com/Ron M/encrypted-blob-server#readme"
-Issues = "https://github.com/Ron M/encrypted-blob-server/issues"
-Source = "https://github.com/Ron M/encrypted-blob-server"
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
+
 
 [project.scripts]
-encrypted_blob_server = "encrypted_blob_server.app:main"
-https_encrypted_blob_server = "encrypted_blob_server.docker-entrypoint:main"
+encrypted-blob-server = "encrypted_blob_server.app:main"
 
-
-[tool.hatch.version]
-path = "src/encrypted_blob_server/__about__.py"
-
-[tool.hatch.envs.types]
-extra-dependencies = [
-  "mypy>=1.0.0",
-]
-[tool.hatch.envs.types.scripts]
-check = "mypy --install-types --non-interactive {args:src/encrypted_blob_server tests}"
-
-[tool.coverage.run]
-source_pkgs = ["encrypted_blob_server", "tests"]
-branch = true
-parallel = true
-omit = [
-  "src/encrypted_blob_server/__about__.py",
+[dependency-groups]
+dev = [
+    "encrypted-blob-server",
 ]
 
-[tool.coverage.paths]
-encrypted_blob_server = ["src/encrypted_blob_server", "*/encrypted-blob-server/src/encrypted_blob_server"]
-tests = ["tests", "*/encrypted-blob-server/tests"]
-
-[tool.coverage.report]
-exclude_lines = [
-  "no cov",
-  "if __name__ == .__main__.:",
-  "if TYPE_CHECKING:",
-]
+[tool.uv.sources]
+encrypted-blob-server = { workspace = true }

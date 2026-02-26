@@ -290,7 +290,6 @@ class BlobStorage:
                     mime_enc BLOB NOT NULL,
                     content_nonce BLOB NOT NULL,
                     content_enc BLOB NOT NULL,
-                    created_at TEXT NOT NULL,
                     UNIQUE(path_hash)
                 )
             """)
@@ -312,15 +311,14 @@ class BlobStorage:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO blobs 
-                (path_hash, mime_nonce, mime_enc, content_nonce, content_enc, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (path_hash, mime_nonce, mime_enc, content_nonce, content_enc)
+                VALUES (?, ?, ?, ?, ?)
             """, (
                 path_hash,
                 mime_nonce,
                 mime_enc,
                 content_nonce,
-                content_enc,
-                datetime.utcnow().isoformat()
+                content_enc
             ))
             conn.commit()
     
@@ -426,6 +424,9 @@ def send_partial_content(content: bytes, mime_type: str):
         response.headers['Content-Type'] = mime_type
         response.headers['Accept-Ranges'] = 'bytes'
         response.headers['Content-Length'] = len(content)
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
         return response
     
     # Parse range header (e.g., "bytes=0-1023")
@@ -450,6 +451,9 @@ def send_partial_content(content: bytes, mime_type: str):
         response.headers['Content-Range'] = f'bytes {start}-{end}/{len(content)}'
         response.headers['Accept-Ranges'] = 'bytes'
         response.headers['Content-Length'] = len(chunk)
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
         return response
         
     except (ValueError, IndexError):
