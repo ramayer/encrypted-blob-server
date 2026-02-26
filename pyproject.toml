@@ -7,7 +7,7 @@ name = "encrypted-blob-server"
 dynamic = ["version"]
 description = ''
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.12"
 #license = "MIT" # CC0 is closest
 keywords = []
 authors = [
@@ -16,17 +16,11 @@ authors = [
 classifiers = [
   "Development Status :: 4 - Beta",
   "Programming Language :: Python",
-  "Programming Language :: Python :: 3.8",
-  "Programming Language :: Python :: 3.9",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: Implementation :: CPython",
-  "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dependencies = [
-  "flask",
-  "cryptography"
+    "flask>=3.1",
+    "cryptography>=42.0",
+    "mitmproxy>=12.1",
 ]
 [project.urls]
 Documentation = "https://github.com/Ron M/encrypted-blob-server#readme"
@@ -35,6 +29,8 @@ Source = "https://github.com/Ron M/encrypted-blob-server"
 
 [project.scripts]
 encrypted_blob_server = "encrypted_blob_server.app:main"
+https_encrypted_blob_server = "encrypted_blob_server.docker-entrypoint:main"
+
 
 [tool.hatch.version]
 path = "src/encrypted_blob_server/__about__.py"
