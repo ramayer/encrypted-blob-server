@@ -183,7 +183,12 @@ class HtmlAssets:
             <h2>📤 Upload a new blob here</h2>
             <input type="file" name="file" id="fileInput" required>
             <br>
+            <!--
             <button type="submit" id="uploadBtn">Upload to /{{ path }}</button>
+            -->
+            <input type="text" id="pathInput" value="{{ path }}" required>
+            <button type="submit" id="uploadBtn">Upload</button>
+            <button type="button" id="deleteBtn">Delete</button>
             <div class="note">The file will be encrypted and stored at this path in your namespace.</div>
         </form>
 
@@ -207,6 +212,8 @@ class HtmlAssets:
                 uploadBtn.textContent = 'Uploading...';
                 
                 try {
+
+                    /*
                     const response = await fetch('/{{ path }}', {
                         method: 'PUT',
                         body: file,
@@ -214,7 +221,15 @@ class HtmlAssets:
                             'Content-Type': file.type || 'application/octet-stream'
                         }
                     });
-                    
+                    */
+                    const path = document.getElementById('pathInput').value.trim();
+                    const response = await fetch('/' + path, {
+                        method: 'PUT',
+                        body: file,
+                        headers: {
+                            'Content-Type': file.type || 'application/octet-stream'
+                        }
+                    });
                     if (response.ok) {
                         window.location.reload();
                     } else {
@@ -226,6 +241,23 @@ class HtmlAssets:
                     alert('Upload error: ' + error.message);
                     uploadBtn.disabled = false;
                     uploadBtn.textContent = 'Upload to /{{ path }}';
+                }
+            });
+
+            document.getElementById('deleteBtn').addEventListener('click', async () => {
+                const path = document.getElementById('pathInput').value.trim();
+                if (!confirm("Delete /" + path + "?")) return;
+
+                const response = await fetch('/' + path, {
+                    method: 'PUT',
+                    body: ''
+                });
+
+                if (response.status === 204) {
+                    alert("Deleted.");
+                    window.location.href = '/';
+                } else {
+                    alert("Not found.");
                 }
             });
         </script>
@@ -427,6 +459,9 @@ def send_partial_content(content: bytes, mime_type: str):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, PUT, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         return response
     
     # Parse range header (e.g., "bytes=0-1023")
@@ -440,6 +475,7 @@ def send_partial_content(content: bytes, mime_type: str):
         if start >= len(content) or start < 0 or end < start:
             response = make_response("Invalid range", 416)
             response.headers['Content-Range'] = f'bytes */{len(content)}'
+            response.headers['Access-Control-Allow-Origin'] = '*'
             return response
         
         end = min(end, len(content) - 1)
@@ -454,11 +490,15 @@ def send_partial_content(content: bytes, mime_type: str):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
         response.headers['Pragma'] = 'no-cache'
         response.headers['Expires'] = '0'
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, PUT, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         return response
         
     except (ValueError, IndexError):
         response = make_response("Invalid range format", 416)
         response.headers['Content-Range'] = f'bytes */{len(content)}'
+        response.headers['Access-Control-Allow-Origin'] = '*'
         return response
 
 
@@ -507,23 +547,51 @@ def get_blob_route(blob_path):
     
     return send_partial_content(content, mime_type)
 
+# @app.route('/<path:blob_path>', methods=['DELETE'])
+# def delete_blob_route(blob_path):
+#     """Delete a blob from the current namespace."""
+#     session = Session.from_request()
+#     if not session:
+#         return redirect(f'/_/login?next=/{blob_path}')
+
+#     # Compute path hash for this user's namespace
+#     path_hash = session.crypto.compute_path_hash(blob_path)
+#     path_hash_b64 = b64encode(path_hash).decode()
+
+#     # Attempt deletion
+#     deleted = session.storage.delete_blob(path_hash_b64)
+
+#     # Clear cache (since blob may have been cached)
+#     Session.get_cached_blob.cache_clear()
+
+#     if deleted:
+#         return '', 204  # No Content
+#     else:
+#         return "Blob not found", 404
 
 @app.route('/<path:blob_path>', methods=['PUT', 'POST'])
 def put_blob_route(blob_path):
-    """Encrypt and store a blob."""
+    """Encrypt/store or delete a blob."""
     session = Session.from_request()
     if not session:
         return redirect(f'/_/login?next=/{blob_path}')
-    
-    # Get content and MIME type
+
     content = request.get_data()
     mime_type = request.content_type or 'application/octet-stream'
-    
-    if not content:
-        return "No content provided", 400
-    
+
+    # Treat empty body as delete
+    if len(content) == 0:
+        path_hash = session.crypto.compute_path_hash(blob_path)
+        path_hash_b64 = b64encode(path_hash).decode()
+        deleted = session.storage.delete_blob(path_hash_b64)
+        Session.get_cached_blob.cache_clear()
+
+        if deleted:
+            return '', 204
+        else:
+            return "Blob not found", 404
+
     session.store_blob(blob_path, content, mime_type)
-    
     return make_response(f"Blob stored at /{blob_path}", 201)
 
 @app.route('/', methods=['GET'])

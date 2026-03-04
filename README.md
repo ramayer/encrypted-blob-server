@@ -159,8 +159,8 @@ This demonstrates the password-scoped nature of the store.
 You can use an image placeholder service or grab local images. Example using `placekitten.com` (or replace with your own images):
 
 ```bash
-curl -o cat1.jpg https://placekitten.com/800/600
-curl -o cat2.jpg https://placekitten.com/801/600
+curl -o cat1.jpg https://cataas.com/cat
+curl -o cat2.jpg https://cataas.com/cat
 ```
 
 2. **Upload cat1.jpg under password `pass1`**
@@ -187,6 +187,12 @@ ls -l seen-by-pass1.jpg seen-by-pass2.jpg
 ```
 
 If you run the same steps against the Docker HTTPS server, use `https://localhost:8443/` and `--cacert ~/encblob-mitm/mitmproxy-ca-cert.pem` for curl verification.
+
+5. ** Delete **
+
+```bash
+curl -b cookies.txt -X DELETE http://localhost:5000/videos/my-video.mp4
+```
 
 ---
 
