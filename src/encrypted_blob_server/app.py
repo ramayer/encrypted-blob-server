@@ -358,10 +358,10 @@ class BlobStorage:
             ))
             conn.commit()
     
-    def delete_blob(self, path_hash: bytes) -> bool:
-        """Delete a blob from database."""
+    def delete_blob(self, path_hash_b64: str) -> bool:
+        """Delete a blob from database. path_hash_b64 is a base64-encoded string."""
         with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("DELETE FROM blobs WHERE path_hash = ?", (path_hash,))
+            cursor = conn.execute("DELETE FROM blobs WHERE path_hash = ?", (path_hash_b64,))
             conn.commit()
             return cursor.rowcount > 0
 
@@ -382,16 +382,11 @@ class Session:
             return None
         try:
             token = b64decode(cookie)
+            if len(token) != 32:
+                return None
             return Session(token)
-        except:
+        except Exception:
             return None
-    
-    @functools.lru_cache(maxsize=128)
-    @staticmethod
-    def get_cached_blob(token: bytes, path: str, db_path: str):
-        s = Session(token)
-        mime_type,content = s.get_blob(path)
-        return mime_type,content
     
     def set_cookie(self, response: Response):
         """Set session cookie on Flask response."""
@@ -445,70 +440,59 @@ class Session:
         
         # Store in database
         self.storage.store_blob(path_hash_b64, mime_nonce, mime_enc, content_nonce, content_enc)
-        
-        # Clear cache
-        Session.get_cached_blob.cache_clear()
 
     # Ability to lock a namespace
     def is_locked(self) -> bool:
         mime, content = self.get_blob(LOCK_PATH)
         return mime is not None
 
+    @staticmethod
+    def _derive_write_key(username: str, write_password: str) -> bytes:
+        """Derive a write-access key from username and write password."""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=STATIC_SALT,
+            iterations=100_000,
+        )
+        return kdf.derive(f"{username}:{write_password}".encode())
+
+    @staticmethod
+    def _compute_write_proof(write_key: bytes, lock_secret: bytes) -> bytes:
+        """Compute HMAC proof that write_key is authorised for this lock_secret."""
+        return hmac.digest(write_key, lock_secret, "sha256")
+
     def verify_write_password(self, username: str, write_password: str) -> bool:
         mime, content = self.get_blob(LOCK_PATH)
         if not mime:
             return False
-
         try:
             payload = json.loads(content.decode())
             lock_secret = bytes.fromhex(payload["lock_secret"])
             stored_proof = bytes.fromhex(payload["write_proof"])
-
-            write_key = hashlib.pbkdf2_hmac(
-                "sha256",
-                f"{username}:{write_password}".encode(),
-                STATIC_SALT,
-                100_000,
-            )
-
-            computed = hmac.new(write_key, lock_secret, hashlib.sha256).digest()
+            write_key = self._derive_write_key(username, write_password)
+            computed = self._compute_write_proof(write_key, lock_secret)
             return hmac.compare_digest(stored_proof, computed)
-        except:
+        except Exception:
             return False
-        
 
-    def create_lock(self, username: str, write_password: str):
+    def create_lock(self, username: str, write_password: str) -> bool:
         if self.is_locked():
             return False
-
-        write_key = hashlib.pbkdf2_hmac(
-            "sha256",
-            f"{username}:{write_password}".encode(),
-            STATIC_SALT,
-            100_000,
-        )
-
+        write_key = self._derive_write_key(username, write_password)
         lock_secret = secrets.token_bytes(32)
-        write_proof = hmac.new(write_key, lock_secret, hashlib.sha256).digest()
-
+        write_proof = self._compute_write_proof(write_key, lock_secret)
         payload = {
             "lock_secret": lock_secret.hex(),
             "write_proof": write_proof.hex(),
         }
-
-        self.store_blob(
-            LOCK_PATH,
-            json.dumps(payload).encode(),
-            "application/json"
-        )
-
+        self.store_blob(LOCK_PATH, json.dumps(payload).encode(), "application/json")
         return True
-    
+
     def remove_lock(self):
         path_hash = self.crypto.compute_path_hash(LOCK_PATH)
         path_hash_b64 = b64encode(path_hash).decode()
         self.storage.delete_blob(path_hash_b64)
-        Session.get_cached_blob.cache_clear()
 
     def update_index(self, add_path=None, remove_path=None):
         mime, content = self.get_blob(INDEX_PATH)
@@ -626,16 +610,15 @@ def logout():
 @app.route('/<path:blob_path>', methods=['GET'])
 def get_blob_route(blob_path):
     """Retrieve and decrypt a blob with range request support."""
-    sessionobj = Session.from_request()
-    if not sessionobj:
+    session_obj = Session.from_request()
+    if not session_obj:
         return redirect(f'/_/login?next=/{blob_path}')
-    
-    #mime_type, content = session.get_blob(blob_path)
-    mime_type, content = Session.get_cached_blob(sessionobj.token, blob_path, None)
-    
+
+    mime_type, content = session_obj.get_blob(blob_path)
+
     if not mime_type:
         return render_template_string(HtmlAssets.NOT_FOUND_WITH_UPLOAD, path=blob_path), 404
-    
+
     return send_partial_content(content, mime_type)
 
 
@@ -644,6 +627,10 @@ def put_blob_route(blob_path):
     session_obj = Session.from_request()
     if not session_obj:
         return redirect(f'/_/login?next=/{blob_path}')
+
+    # Protect internal reserved paths from direct user writes
+    if blob_path.startswith('.meta/'):
+        return "Path is reserved", 403
 
     # Enforce lock
     if session_obj.is_locked() and not session.get("write_enabled"):
@@ -657,7 +644,6 @@ def put_blob_route(blob_path):
         path_hash = session_obj.crypto.compute_path_hash(blob_path)
         path_hash_b64 = b64encode(path_hash).decode()
         deleted = session_obj.storage.delete_blob(path_hash_b64)
-        Session.get_cached_blob.cache_clear()
 
         if deleted:
             session_obj.update_index(remove_path=blob_path)
@@ -667,7 +653,6 @@ def put_blob_route(blob_path):
 
     session_obj.store_blob(blob_path, content, mime_type)
     session_obj.update_index(add_path=blob_path)
-
     return make_response(f"Blob stored at /{blob_path}", 201)
 
 
@@ -775,15 +760,15 @@ def view_index():
 @app.errorhandler(404)
 def not_found(e):
     """Custom 404 handler."""
-    sessionobj = Session.from_request()
-    if not sessionobj:
+    session_obj = Session.from_request()
+    if not session_obj:
         return redirect(f'/_/login?next={request.path}')
-    
-    path = request.path.lstrip('/')
-    if path.startswith('_/'):
-        return "Not found", 404
-    return render_template_string(HtmlAssets.NOT_FOUND_WITH_UPLOAD, path=path), 404
 
+    path = request.path.lstrip('/')
+    if not path or path.startswith('_/') or path.startswith('.meta/'):
+        return "Not found", 404
+
+    return render_template_string(HtmlAssets.NOT_FOUND_WITH_UPLOAD, path=path), 404
 def main():
     print("=" * 60)
     print("🔐 Encrypted Blob Storage Server")
