@@ -12,9 +12,12 @@ from pathlib import Path
 from base64 import b64encode, b64decode
 from datetime import datetime
 from flask import Flask, request, make_response, Response, redirect, render_template_string
+from flask import session
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
+import hmac
+import json
 
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(32)
@@ -22,7 +25,8 @@ app.secret_key = secrets.token_hex(32)
 COOKIE_NAME = "blob_session"
 COOKIE_MAX_AGE = 3600 * 24  # 24 hours
 STATIC_SALT = b"encrypted-blob-storage-v1-salt-change-in-production"
-
+LOCK_PATH = "/.meta/locked"
+INDEX_PATH = "/.meta/index"
 
 class HtmlAssets:
     """HTML templates and shared styling."""
@@ -445,6 +449,92 @@ class Session:
         # Clear cache
         Session.get_cached_blob.cache_clear()
 
+    # Ability to lock a namespace
+    def is_locked(self) -> bool:
+        mime, content = self.get_blob(LOCK_PATH)
+        return mime is not None
+
+    def verify_write_password(self, username: str, write_password: str) -> bool:
+        mime, content = self.get_blob(LOCK_PATH)
+        if not mime:
+            return False
+
+        try:
+            payload = json.loads(content.decode())
+            lock_secret = bytes.fromhex(payload["lock_secret"])
+            stored_proof = bytes.fromhex(payload["write_proof"])
+
+            write_key = hashlib.pbkdf2_hmac(
+                "sha256",
+                f"{username}:{write_password}".encode(),
+                STATIC_SALT,
+                100_000,
+            )
+
+            computed = hmac.new(write_key, lock_secret, hashlib.sha256).digest()
+            return hmac.compare_digest(stored_proof, computed)
+        except:
+            return False
+        
+
+    def create_lock(self, username: str, write_password: str):
+        if self.is_locked():
+            return False
+
+        write_key = hashlib.pbkdf2_hmac(
+            "sha256",
+            f"{username}:{write_password}".encode(),
+            STATIC_SALT,
+            100_000,
+        )
+
+        lock_secret = secrets.token_bytes(32)
+        write_proof = hmac.new(write_key, lock_secret, hashlib.sha256).digest()
+
+        payload = {
+            "lock_secret": lock_secret.hex(),
+            "write_proof": write_proof.hex(),
+        }
+
+        self.store_blob(
+            LOCK_PATH,
+            json.dumps(payload).encode(),
+            "application/json"
+        )
+
+        return True
+    
+    def remove_lock(self):
+        path_hash = self.crypto.compute_path_hash(LOCK_PATH)
+        path_hash_b64 = b64encode(path_hash).decode()
+        self.storage.delete_blob(path_hash_b64)
+        Session.get_cached_blob.cache_clear()
+
+    def update_index(self, add_path=None, remove_path=None):
+        mime, content = self.get_blob(INDEX_PATH)
+
+        if mime:
+            index = json.loads(content.decode())
+        else:
+            index = {"version": 1, "paths": []}
+
+        paths = set(index["paths"])
+
+        if add_path:
+            paths.add(add_path)
+
+        if remove_path:
+            paths.discard(remove_path)
+
+        index["paths"] = sorted(paths)
+
+        self.store_blob(
+            INDEX_PATH,
+            json.dumps(index).encode(),
+            "application/json"
+        )
+
+## Main app functions
 
 def send_partial_content(content: bytes, mime_type: str):
     """Handle HTTP Range requests for partial content delivery."""
@@ -514,11 +604,12 @@ def login():
         if username and password:
             # Derive session token (expensive PBKDF2)
             token = CryptoManager.derive_session_token(username, password)
-            session = Session(token)
+            sessionobj = Session(token)
             
             # Redirect back to where they came from
             response = redirect(next_url)
-            session.set_cookie(response)
+            sessionobj.set_cookie(response)
+            session["username"] = username
             return response
     
     return render_template_string(HtmlAssets.LOGIN_FORM, next_url=next_url)
@@ -535,64 +626,50 @@ def logout():
 @app.route('/<path:blob_path>', methods=['GET'])
 def get_blob_route(blob_path):
     """Retrieve and decrypt a blob with range request support."""
-    session = Session.from_request()
-    if not session:
+    sessionobj = Session.from_request()
+    if not sessionobj:
         return redirect(f'/_/login?next=/{blob_path}')
     
     #mime_type, content = session.get_blob(blob_path)
-    mime_type, content = Session.get_cached_blob(session.token, blob_path, None)
+    mime_type, content = Session.get_cached_blob(sessionobj.token, blob_path, None)
     
     if not mime_type:
         return render_template_string(HtmlAssets.NOT_FOUND_WITH_UPLOAD, path=blob_path), 404
     
     return send_partial_content(content, mime_type)
 
-# @app.route('/<path:blob_path>', methods=['DELETE'])
-# def delete_blob_route(blob_path):
-#     """Delete a blob from the current namespace."""
-#     session = Session.from_request()
-#     if not session:
-#         return redirect(f'/_/login?next=/{blob_path}')
-
-#     # Compute path hash for this user's namespace
-#     path_hash = session.crypto.compute_path_hash(blob_path)
-#     path_hash_b64 = b64encode(path_hash).decode()
-
-#     # Attempt deletion
-#     deleted = session.storage.delete_blob(path_hash_b64)
-
-#     # Clear cache (since blob may have been cached)
-#     Session.get_cached_blob.cache_clear()
-
-#     if deleted:
-#         return '', 204  # No Content
-#     else:
-#         return "Blob not found", 404
 
 @app.route('/<path:blob_path>', methods=['PUT', 'POST'])
 def put_blob_route(blob_path):
-    """Encrypt/store or delete a blob."""
-    session = Session.from_request()
-    if not session:
+    session_obj = Session.from_request()
+    if not session_obj:
         return redirect(f'/_/login?next=/{blob_path}')
+
+    # Enforce lock
+    if session_obj.is_locked() and not session.get("write_enabled"):
+        return "Namespace is locked (read-only)", 403
 
     content = request.get_data()
     mime_type = request.content_type or 'application/octet-stream'
 
-    # Treat empty body as delete
+    # Empty body = delete
     if len(content) == 0:
-        path_hash = session.crypto.compute_path_hash(blob_path)
+        path_hash = session_obj.crypto.compute_path_hash(blob_path)
         path_hash_b64 = b64encode(path_hash).decode()
-        deleted = session.storage.delete_blob(path_hash_b64)
+        deleted = session_obj.storage.delete_blob(path_hash_b64)
         Session.get_cached_blob.cache_clear()
 
         if deleted:
+            session_obj.update_index(remove_path=blob_path)
             return '', 204
         else:
             return "Blob not found", 404
 
-    session.store_blob(blob_path, content, mime_type)
+    session_obj.store_blob(blob_path, content, mime_type)
+    session_obj.update_index(add_path=blob_path)
+
     return make_response(f"Blob stored at /{blob_path}", 201)
+
 
 @app.route('/', methods=['GET'])
 def get_root_blob():
@@ -602,11 +679,104 @@ def get_root_blob():
 def put_root_blob():
     return put_blob_route('index.html')  # Or handle however you want
 
+@app.route('/_/lock', methods=['GET', 'POST'])
+def lock_namespace():
+    session_obj = Session.from_request()
+    if not session_obj:
+        return redirect('/_/login')
+
+    if request.method == 'GET':
+        return f"""
+        <h3>Lock Namespace</h3>
+        <form method="POST">
+            Username:<br>
+            <input name="username" value="{session.get('username', '')}"><br><br>
+            Write Password:<br>
+            <input type="password" name="write_password"><br><br>
+            <button type="submit">Lock</button>
+        </form>
+        """
+
+    # POST
+    write_password = request.form.get("write_password", "")
+    username = request.form.get("username", "")
+
+    if not username or not write_password:
+        return "Missing credentials", 400
+
+    if session_obj.is_locked():
+        return "Already locked", 400
+
+    created = session_obj.create_lock(username, write_password)
+    if not created:
+        return "Already locked", 400
+
+    session["write_enabled"] = False
+    return "Namespace locked"
+
+@app.route('/_/unlock', methods=['GET', 'POST'])
+def unlock_namespace():
+    session_obj = Session.from_request()
+    if not session_obj:
+        return redirect('/_/login')
+
+    if request.method == 'GET':
+        return f"""
+        <h3>Unlock Namespace (Write Access)</h3>
+        <form method="POST">
+            Username:<br>
+            <input name="username" value="{session.get('username', '')}"><br><br>
+            Write Password:<br>
+            <input type="password" name="write_password"><br><br>
+            <button type="submit">Unlock</button>
+        </form>
+        """
+
+    # POST
+    write_password = request.form.get("write_password", "")
+    username = request.form.get("username", "")
+
+    if not username or not write_password:
+        return "Missing credentials", 400
+
+    if not session_obj.is_locked():
+        return "Not locked", 400
+
+    if session_obj.verify_write_password(username, write_password):
+        session["write_enabled"] = True
+        return "Unlocked for this session"
+    else:
+        return "Incorrect write password", 403
+
+import json
+@app.route('/_/index', methods=['GET'])
+def view_index():
+    session_obj = Session.from_request()
+    if not session_obj:
+        return redirect('/_/login')
+
+    mime, content = session_obj.get_blob(INDEX_PATH)
+
+    if not mime:
+        return "<h3>No index found.</h3>"
+
+    try:
+        index = json.loads(content.decode())
+    except:
+        return "Corrupted index", 500
+
+    html = "<h3>Namespace Index</h3><ul>"
+    for path in index.get("paths", []):
+        html += f'<li><a href="/{path}">{path}</a></li>'
+    html += "</ul>"
+
+    return html
+
 @app.errorhandler(404)
 def not_found(e):
     """Custom 404 handler."""
-    session = Session.from_request()
-    if not session:
+    sessionobj = Session.from_request()
+    if not sessionobj:
         return redirect(f'/_/login?next={request.path}')
     
     path = request.path.lstrip('/')
