@@ -4,9 +4,9 @@ A tiny, minimal HTTP server that stores **encrypted blobs** in SQLite and decryp
 
 **Main benefits**
 
-* **Encrypted storage** — no password or global key is stored server-side. Blobs are encrypted using a key derived from the password supplied by the client. If disk is stolen, data at rest remains encrypted.
+* **Encrypted storage** — no password or global key is stored server-side. Blobs are encrypted using a key derived from the password supplied by the client. If a disk is stolen, data at rest remains encrypted.
 * **Password‑scoped content** — the same URL path can map to different decrypted content for different passwords. This lets multiple users share the same URLs but see different content (or lets a single user host multiple sites from the same server by switching passwords).
-* **No complex signup** — the password itself is the namespace: set the password via the `/_/login` endpoint and the server uses that to encrypt/decrypt.
+* **No complex signup** — the password itself is the namespace.  If you log in with a new username/password 
 
 ---
 
@@ -208,6 +208,23 @@ curl -b cookies.txt -X DELETE http://localhost:5000/videos/my-video.mp4
 ## Contributing
 
 Patches and improvements welcome. If you make changes, please include tests for any crypto or storage changes — accidental incompatibilities will make old blobs undecryptable.
+
+If you choose to use a LLM to help code, please consider configuring it to generate code in a simiilar style, focused on clarity and auditability.  I find this prompt to work well.
+
+```
+We're working on a small Python server project. Please write in a style optimised for clarity, auditability, and simplicity — the kind of code a security-conscious reader should be able to understand in one sitting. Specific guidance:
+- Functions over classes when there's no genuine persistent state to encapsulate. Free functions with explicit parameters are easier to audit than methods with implicit self.
+- Flat over nested. Avoid deep call hierarchies. A reader should be able to trace a request path without jumping through many layers of abstraction.
+- Comments explain why, not what. Don't restate the code. Do comment on non-obvious security decisions, subtle invariants, and anything a future reader might be tempted to "fix" incorrectly.
+- Short functions are good; trivial wrapper functions are not. A two-line function is fine if it has a meaningful name. A one-line function that just renames another function adds noise.
+- Inline HTML and CSS in a single file rather than templates or asset files, for a project this size. Minify CSS. Keep JavaScript minimal and inline.
+- No unnecessary abstraction. Don't create a class, module, or layer of indirection in anticipation of future needs. Write for the current requirements.
+- Prefer the standard library. Reach for a third-party library only when it provides something cryptographically necessary or genuinely hard to replicate correctly.
+- Line count is a proxy for audit burden. Prefer fewer lines. When two approaches are otherwise equal, choose the shorter one.
+- When uncertain between simple-and-slightly-wrong vs complex-and-correct, flag the tradeoff explicitly rather than silently choosing complexity.
+Before suggesting a major architectural direction, think out loud about the tradeoffs. Prefer to brainstorm before writing code when the design is still open.
+```
+
 
 ---
 
