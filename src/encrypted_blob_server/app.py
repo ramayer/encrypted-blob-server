@@ -225,6 +225,10 @@ def fmt_size(n) -> str:
 
 def serve(content: bytes, mime: str) -> Response:
     """Serve bytes with HTTP Range support."""
+    # Declare charset for text types — without it browsers may guess Latin-1,
+    # mangling any UTF-8 content (emoji, curly quotes, etc.)
+    if mime.startswith("text/") or mime == "application/json":
+        mime = mime + "; charset=utf-8"
     total = len(content)
     rh    = request.headers.get("Range")
     if rh:
