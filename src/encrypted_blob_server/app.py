@@ -2,1079 +2,527 @@
 """
 Encrypted Blob Storage Server
 
-Each username+password combination derives a unique encryption key via PBKDF2.
-Blobs are stored encrypted in SQLite; credentials are never stored anywhere.
+Each username+password derives a unique encryption key via PBKDF2.
+Blobs are stored encrypted in SQLite; credentials are never stored.
 Different credentials = completely isolated, indistinguishable namespaces.
 
-Reserved paths (not writable via PUT):
-  /_/locked   — lock blob (write-protection state)
-  /_/index    — index blob (file listing + metadata)
+Reserved paths (blocked from user PUT):
+  _/index   — file listing + metadata (JSON)
+  _/locked  — write-lock blob (JSON)
 
 UI routes:
   /_/login
   /_/logout
-  /_/readonly   — set/unset write lock
-  /_/index      — file manager home page
+  /_/admin    — index, upload, and lock management in one page
+
+Optional server-side control:
+  INVITE_TOKEN   — if set, new namespaces require this token at login
 """
 
-import sqlite3
-import hashlib
-import secrets
-import threading
-from pathlib import Path
+import sqlite3, hashlib, secrets, threading, hmac, json
 from base64 import b64encode, b64decode
 from datetime import datetime, timezone
-from flask import Flask, request, make_response, Response, redirect, render_template_string
+from flask import Flask, request, make_response, redirect, render_template_string, Response
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
-import hmac
-import json
 
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# ── Constants ────────────────────────────────────────────────────────────────
 
-COOKIE_NAME       = "blob_session"
-WRITE_COOKIE_NAME = "blob_write"
-COOKIE_MAX_AGE    = 3600 * 24  # 24 hours
+STATIC_SALT    = b"encrypted-blob-storage-v1-salt-change-in-production"
+SESSION_COOKIE = "bs_session"
+WRITE_COOKIE   = "bs_write"
+COOKIE_AGE     = 86400          # 24 h
+LOCK_PATH      = "_/locked"
+INDEX_PATH     = "_/index"
+RESERVED       = {LOCK_PATH, INDEX_PATH}
+INVITE_TOKEN   = None           # Set to a string to restrict new namespace creation
+CACHE_MAX      = 64             # Max cached decrypted blobs
 
-# Change this in production — it salts every derived key in the system.
-STATIC_SALT = b"encrypted-blob-storage-v1-salt-change-in-production"
+# ── Thread-safe blob cache (keyed on path_hash, never on raw token) ──────────
 
-# Reserved internal paths — protected from direct user writes.
-LOCK_PATH  = "_/locked"
-INDEX_PATH = "_/index"
-RESERVED_PATHS = {LOCK_PATH, INDEX_PATH}
+_cache: dict[str, tuple] = {}
+_cache_lock = threading.Lock()
 
+def cache_get(k):
+    with _cache_lock: return _cache.get(k)
 
-# ---------------------------------------------------------------------------
-# Write-session store
-#
-# Maps a random write-token (str) → namespace_id (bytes).
-# A write-token is set when the user proves knowledge of the write password.
-# Server restart clears all write sessions, which is acceptable behaviour.
-# ---------------------------------------------------------------------------
+def cache_set(k, v):
+    with _cache_lock:
+        if len(_cache) >= CACHE_MAX:
+            _cache.pop(next(iter(_cache)))
+        _cache[k] = v
+
+def cache_del(k):
+    with _cache_lock: _cache.pop(k, None)
+
+def cache_clear():
+    with _cache_lock: _cache.clear()
+
+# ── Thread-safe write-session store ──────────────────────────────────────────
+# Maps random token -> namespace_id. Server restart clears all write sessions.
 
 _write_sessions: dict[str, bytes] = {}
-_write_sessions_lock = threading.Lock()
+_ws_lock = threading.Lock()
 
-
-def _create_write_session(namespace_id: bytes) -> str:
-    """Mint a new write token for this namespace and store it."""
+def ws_create(namespace_id: bytes) -> str:
     token = secrets.token_hex(32)
-    with _write_sessions_lock:
-        _write_sessions[token] = namespace_id
+    with _ws_lock: _write_sessions[token] = namespace_id
     return token
 
-
-def _check_write_session(token: str, namespace_id: bytes) -> bool:
-    """Return True if token grants write access to this namespace."""
-    with _write_sessions_lock:
-        stored = _write_sessions.get(token)
+def ws_check(token: str, namespace_id: bytes) -> bool:
+    with _ws_lock: stored = _write_sessions.get(token)
     return stored is not None and hmac.compare_digest(stored, namespace_id)
 
-
-def _revoke_write_session(token: str):
-    with _write_sessions_lock:
-        _write_sessions.pop(token, None)
-
-
-# ---------------------------------------------------------------------------
-# Blob cache
-#
-# Keyed on (path_hash_b64, db_path) — never on the raw session token.
-# Thread-safe via a simple lock around the dict.
-# ---------------------------------------------------------------------------
-
-_blob_cache: dict[tuple, tuple[str, bytes]] = {}
-_blob_cache_lock = threading.Lock()
-_CACHE_MAX_ENTRIES = 64
-
-
-def _cache_get(path_hash_b64: str, db_path: str) -> tuple[str, bytes] | None:
-    with _blob_cache_lock:
-        return _blob_cache.get((path_hash_b64, db_path))
-
-
-def _cache_set(path_hash_b64: str, db_path: str, mime: str, content: bytes):
-    with _blob_cache_lock:
-        if len(_blob_cache) >= _CACHE_MAX_ENTRIES:
-            # Evict the oldest entry (insertion-ordered dict, Python 3.7+)
-            _blob_cache.pop(next(iter(_blob_cache)))
-        _blob_cache[(path_hash_b64, db_path)] = (mime, content)
-
-
-def _cache_invalidate(path_hash_b64: str, db_path: str):
-    with _blob_cache_lock:
-        _blob_cache.pop((path_hash_b64, db_path), None)
-
-
-def _cache_clear():
-    with _blob_cache_lock:
-        _blob_cache.clear()
-
-
-# ---------------------------------------------------------------------------
-# HTML Assets
-# ---------------------------------------------------------------------------
-
-class HtmlAssets:
-    """HTML templates and shared styling."""
-
-    COMMON_STYLE = """
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            max-width: 500px;
-            margin: 80px auto;
-            padding: 20px;
-            background: #f5f5f5;
-        }
-        .box {
-            background: white;
-            padding: 40px;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        h1 { margin-top: 0; color: #333; font-size: 24px; }
-        h2 { color: #444; font-size: 18px; margin-top: 30px; }
-        p  { color: #666; line-height: 1.5; }
-        input[type="text"],
-        input[type="password"],
-        input[type="file"] {
-            width: 100%;
-            padding: 12px;
-            margin: 8px 0;
-            box-sizing: border-box;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        input:focus { outline: none; border-color: #007bff; }
-        button {
-            width: 100%;
-            padding: 12px 20px;
-            background: #007bff;
-            color: white;
-            border: none;
-            cursor: pointer;
-            border-radius: 4px;
-            font-size: 14px;
-            font-weight: 500;
-            margin-top: 8px;
-        }
-        button:hover    { background: #0056b3; }
-        button:disabled { background: #6c757d; cursor: not-allowed; }
-        button.danger   { background: #dc3545; }
-        button.danger:hover { background: #a71d2a; }
-        button.secondary { background: #6c757d; }
-        button.secondary:hover { background: #545b62; }
-        .note {
-            font-size: 12px;
-            color: #888;
-            margin-top: 20px;
-            padding-top: 20px;
-            border-top: 1px solid #eee;
-        }
-        code {
-            background: #f4f4f4;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 0.9em;
-        }
-        pre {
-            background: #f4f4f4;
-            padding: 12px;
-            border-radius: 4px;
-            font-size: 12px;
-            overflow-x: auto;
-            white-space: pre-wrap;
-        }
-        a { color: #007bff; text-decoration: none; font-weight: 500; }
-        a:hover { text-decoration: underline; }
-        .nav {
-            display: flex;
-            gap: 16px;
-            margin-bottom: 24px;
-            font-size: 14px;
-        }
-        .status-badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 600;
-        }
-        .status-locked   { background: #ffeeba; color: #856404; }
-        .status-unlocked { background: #d4edda; color: #155724; }
-    """
-
-    LOGIN_FORM = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Login — Encrypted Blob Storage</title>
-        <style>""" + COMMON_STYLE + """</style>
-    </head>
-    <body>
-        <div class="box">
-            <h1>🔐 Login</h1>
-            <p>Each username + password combination opens a unique encrypted namespace.
-               Your credentials are never stored — only a derived session token.</p>
-            <form method="POST" action="/_/login?next={{ next_url }}">
-                <input type="text"     name="username" placeholder="Username" required autofocus>
-                <input type="password" name="password" placeholder="Password" required>
-                <button type="submit" id="loginBtn" onclick="this.disabled=true;this.textContent='Logging in…';this.form.submit();">
-                    Login
-                </button>
-            </form>
-            <div class="note">
-                Different username/password combinations access completely separate,
-                indistinguishable storage spaces.
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-
-    LOGOUT_PAGE = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Logged Out</title>
-        <style>""" + COMMON_STYLE + """
-            .box { text-align: center; }
-        </style>
-    </head>
-    <body>
-        <div class="box">
-            <h1>👋 Logged Out</h1>
-            <p>Your session has been cleared.</p>
-            <p><a href="/_/login">Login again</a></p>
-        </div>
-    </body>
-    </html>
-    """
-
-    INDEX_PAGE = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>File Index</title>
-        <style>""" + COMMON_STYLE + """
-            body { max-width: 700px; }
-            table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-            th {
-                text-align: left;
-                font-size: 12px;
-                color: #888;
-                font-weight: 600;
-                padding: 6px 8px;
-                border-bottom: 2px solid #eee;
-            }
-            td {
-                padding: 10px 8px;
-                border-bottom: 1px solid #f0f0f0;
-                font-size: 14px;
-                vertical-align: middle;
-            }
-            td.path a { color: #333; font-weight: 500; }
-            td.meta   { color: #999; font-size: 12px; white-space: nowrap; }
-            td.action { width: 40px; text-align: right; }
-            .del-btn {
-                background: none;
-                border: none;
-                cursor: pointer;
-                color: #ccc;
-                font-size: 16px;
-                padding: 4px 6px;
-                width: auto;
-                margin: 0;
-                border-radius: 4px;
-            }
-            .del-btn:hover { color: #dc3545; background: #fff0f0; }
-            .empty { color: #999; font-style: italic; padding: 20px 0; }
-            .upload-area {
-                margin-top: 30px;
-                padding: 24px;
-                background: #f8f9fa;
-                border-radius: 8px;
-                border: 2px dashed #dee2e6;
-            }
-            .lock-status { margin-bottom: 16px; }
-        </style>
-    </head>
-    <body>
-        <div class="nav">
-            <a href="/_/index">📁 Index</a>
-            <a href="/_/readonly">🔒 Access</a>
-            <a href="/_/logout">Logout</a>
-        </div>
-
-        <div class="lock-status">
-            {% if locked %}
-                <span class="status-badge status-locked">🔒 Read-only</span>
-                {% if write_enabled %}
-                    <span class="status-badge status-unlocked" style="margin-left:8px">✏️ Write unlocked</span>
-                {% endif %}
-            {% else %}
-                <span class="status-badge status-unlocked">✏️ Writable</span>
-            {% endif %}
-        </div>
-
-        <h1>File Index</h1>
-
-        {% if files %}
-        <table>
-            <tr>
-                <th>Path</th>
-                <th>Size</th>
-                <th>Uploaded</th>
-                <th></th>
-            </tr>
-            {% for f in files %}
-            <tr id="row-{{ loop.index }}">
-                <td class="path"><a href="/{{ f.path }}">{{ f.path }}</a></td>
-                <td class="meta">{{ f.size }}</td>
-                <td class="meta">{{ f.uploaded }}</td>
-                <td class="action">
-                    <button class="del-btn" title="Delete" onclick="deleteBlob('{{ f.path }}', 'row-{{ loop.index }}')">🗑</button>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
-        {% else %}
-            <p class="empty">No files yet.</p>
-        {% endif %}
-
-        <div class="upload-area">
-            <h2 style="margin-top:0">📤 Upload</h2>
-            <input type="file" id="fileInput">
-            <input type="text"  id="pathInput" placeholder="Path (e.g. images/photo.jpg)">
-            <button id="uploadBtn" onclick="uploadFile()">Upload</button>
-            <div class="note">
-                You can also upload with curl:<br>
-                <pre>curl -c cookies.txt -d 'username=alice&password=secret' http://localhost:5000/_/login
-curl -b cookies.txt -X PUT --data-binary @file.mp4 \\
-     -H 'Content-Type: video/mp4' http://localhost:5000/videos/movie.mp4</pre>
-            </div>
-        </div>
-
-        <script>
-        async function deleteBlob(path, rowId) {
-            if (!confirm("Delete /" + path + "?")) return;
-            const resp = await fetch("/" + path, { method: "PUT", body: "" });
-            if (resp.status === 204) {
-                const row = document.getElementById(rowId);
-                if (row) row.remove();
-            } else {
-                alert("Delete failed: " + resp.statusText);
-            }
-        }
-
-        async function uploadFile() {
-            const file = document.getElementById("fileInput").files[0];
-            const pathVal = document.getElementById("pathInput").value.trim();
-            const btn = document.getElementById("uploadBtn");
-
-            if (!file) { alert("Choose a file first."); return; }
-
-            let path = pathVal || file.name;
-            // strip leading slash
-            path = path.replace(/^\\/+/, "");
-
-            btn.disabled = true;
-            btn.textContent = "Uploading…";
-
-            try {
-                const resp = await fetch("/" + path, {
-                    method: "PUT",
-                    body: file,
-                    headers: { "Content-Type": file.type || "application/octet-stream" }
-                });
-                if (resp.ok) {
-                    window.location.reload();
-                } else {
-                    const msg = await resp.text();
-                    alert("Upload failed: " + msg);
-                    btn.disabled = false;
-                    btn.textContent = "Upload";
-                }
-            } catch (err) {
-                alert("Upload error: " + err.message);
-                btn.disabled = false;
-                btn.textContent = "Upload";
-            }
-        }
-        </script>
-    </body>
-    </html>
-    """
-
-    NOT_FOUND_PAGE = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Not Found — {{ path }}</title>
-        <style>""" + COMMON_STYLE + """
-            body { max-width: 700px; }
-            h1 { color: #dc3545; }
-        </style>
-    </head>
-    <body>
-        <div class="nav">
-            <a href="/_/index">📁 Index</a>
-            <a href="/_/logout">Logout</a>
-        </div>
-        <h1>404 — Not Found</h1>
-        <p>No blob at <code>/{{ path }}</code> in your namespace.</p>
-        <p><a href="/_/index">Go to file index</a> to upload or browse files.</p>
-    </body>
-    </html>
-    """
-
-    READONLY_PAGE = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Access Control</title>
-        <style>""" + COMMON_STYLE + """</style>
-    </head>
-    <body>
-        <div class="nav">
-            <a href="/_/index">📁 Index</a>
-            <a href="/_/logout">Logout</a>
-        </div>
-        <div class="box">
-            <h1>🔒 Access Control</h1>
-
-            {% if locked %}
-                <p>This namespace is <strong>locked (read-only)</strong>.</p>
-                {% if write_enabled %}
-                    <p>You have write access for this session.</p>
-                    <form method="POST">
-                        <input type="hidden" name="action" value="relock">
-                        <button class="danger" type="submit">Revoke write access</button>
-                    </form>
-                {% else %}
-                    <p>Enter your write password to unlock writes for this session.</p>
-                    <form method="POST">
-                        <input type="hidden" name="action" value="unlock">
-                        <input type="password" name="write_password" placeholder="Write password" required autofocus>
-                        <button type="submit">Unlock writes</button>
-                    </form>
-                {% endif %}
-
-                <h2>Remove lock entirely</h2>
-                <p>This permanently removes write protection from the namespace.</p>
-                <form method="POST">
-                    <input type="hidden" name="action" value="remove_lock">
-                    <input type="password" name="write_password" placeholder="Write password" required>
-                    <button class="danger" type="submit">Remove lock</button>
-                </form>
-
-            {% else %}
-                <p>This namespace is <strong>unlocked</strong>. Anyone with the session cookie can write.</p>
-                <p>Set a write password to make the namespace read-only by default,
-                   requiring a separate password to make changes.</p>
-                <form method="POST">
-                    <input type="hidden" name="action" value="lock">
-                    <input type="password" name="write_password" placeholder="Write password" required autofocus>
-                    <input type="password" name="write_password2" placeholder="Confirm write password" required>
-                    <button type="submit">Enable write lock</button>
-                </form>
-            {% endif %}
-
-            {% if message %}
-                <p style="margin-top:20px; color: {% if error %}#dc3545{% else %}#155724{% endif %}">
-                    {{ message }}
-                </p>
-            {% endif %}
-        </div>
-    </body>
-    </html>
-    """
-
-
-# ---------------------------------------------------------------------------
-# CryptoManager
-# ---------------------------------------------------------------------------
-
-class CryptoManager:
-    """Handles all encryption/decryption operations for a session."""
-
-    def __init__(self, session_token: bytes):
-        # Derive encryption key from session token (fast SHA-256, done once)
-        self.key = hashlib.sha256(b"encryption:" + session_token).digest()
-        self.cipher = ChaCha20Poly1305(self.key)
-        # A stable namespace identifier — used for write-session scoping.
-        # Derived separately so we never expose the encryption key.
-        self.namespace_id = hashlib.sha256(b"namespace:" + session_token).digest()
-
-    def encrypt(self, data: bytes) -> tuple[bytes, bytes]:
-        """Encrypt data. Returns (nonce, ciphertext)."""
-        nonce = secrets.token_bytes(12)
-        ciphertext = self.cipher.encrypt(nonce, data, None)
-        return nonce, ciphertext
-
-    def decrypt(self, nonce: bytes, ciphertext: bytes) -> bytes:
-        """Decrypt data. Raises on authentication failure."""
-        return self.cipher.decrypt(nonce, ciphertext, None)
-
-    def compute_path_hash(self, path: str) -> bytes:
-        """Compute a namespace-scoped hash for a path."""
-        combined = f"{path}:{self.key.hex()}"
-        return hashlib.sha256(combined.encode()).digest()
-
-    @staticmethod
-    def derive_session_token(username: str, password: str) -> bytes:
-        """Derive session token via PBKDF2 (expensive — done once at login)."""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=STATIC_SALT,
-            iterations=100_000,
-        )
-        return kdf.derive(f"{username}:{password}".encode())
-
-    @staticmethod
-    def derive_write_key(username: str, write_password: str) -> bytes:
-        """Derive a write-access key from username + write password."""
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=STATIC_SALT,
-            iterations=100_000,
-        )
-        return kdf.derive(f"write:{username}:{write_password}".encode())
-
-    @staticmethod
-    def compute_write_proof(write_key: bytes, lock_secret: bytes) -> bytes:
-        """Compute HMAC-SHA256 proof that write_key authorises this lock_secret."""
-        return hmac.digest(write_key, lock_secret, "sha256")
-
-
-# ---------------------------------------------------------------------------
-# BlobStorage
-# ---------------------------------------------------------------------------
-
-class BlobStorage:
-    """Manages encrypted blob storage in SQLite."""
-
-    def __init__(self, db_path: str = "blobs.sqlite3"):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS blobs (
-                    id            INTEGER PRIMARY KEY,
-                    path_hash     TEXT    NOT NULL UNIQUE,
-                    mime_nonce    BLOB    NOT NULL,
-                    mime_enc      BLOB    NOT NULL,
-                    content_nonce BLOB    NOT NULL,
-                    content_enc   BLOB    NOT NULL
-                )
-            """)
-            conn.commit()
-
-    def get_blob(self, path_hash_b64: str) -> tuple | None:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "SELECT mime_nonce, mime_enc, content_nonce, content_enc "
-                "FROM blobs WHERE path_hash = ?",
-                (path_hash_b64,)
-            )
-            return cursor.fetchone()
-
-    def store_blob(self, path_hash_b64: str, mime_nonce: bytes, mime_enc: bytes,
-                   content_nonce: bytes, content_enc: bytes):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO blobs
-                    (path_hash, mime_nonce, mime_enc, content_nonce, content_enc)
-                VALUES (?, ?, ?, ?, ?)
-            """, (path_hash_b64, mime_nonce, mime_enc, content_nonce, content_enc))
-            conn.commit()
-
-    def delete_blob(self, path_hash_b64: str) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "DELETE FROM blobs WHERE path_hash = ?", (path_hash_b64,)
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-
-# ---------------------------------------------------------------------------
-# Session
-# ---------------------------------------------------------------------------
-
-class Session:
-    """Manages an authenticated user session."""
-
-    def __init__(self, token: bytes):
-        self.token = token
-        self.crypto = CryptoManager(token)
-        self.storage = BlobStorage("blobs.sqlite3")
-
-    @staticmethod
-    def from_request() -> 'Session | None':
-        """Extract session from the session cookie."""
-        cookie = request.cookies.get(COOKIE_NAME)
-        if not cookie:
-            return None
-        try:
-            token = b64decode(cookie)
-            if len(token) != 32:
-                return None
-            return Session(token)
-        except Exception:
-            return None
-
-    def set_cookie(self, response: Response):
-        response.set_cookie(
-            COOKIE_NAME,
-            b64encode(self.token).decode(),
-            max_age=COOKIE_MAX_AGE,
-            httponly=True,
-            secure=False,   # ⚠ Set True in production (HTTPS only) — cookie IS the key
-            samesite='Lax'
-        )
-
-    # ------------------------------------------------------------------
-    # Core blob operations
-    # ------------------------------------------------------------------
-
-    def _path_hash_b64(self, path: str) -> str:
-        return b64encode(self.crypto.compute_path_hash(path)).decode()
-
-    def get_blob(self, path: str) -> tuple[str, bytes] | tuple[None, None]:
-        """Get and decrypt a blob. Returns (mime_type, content) or (None, None)."""
-        phb64 = self._path_hash_b64(path)
-
-        # Check cache first
-        cached = _cache_get(phb64, self.storage.db_path)
-        if cached is not None:
-            return cached
-
-        row = self.storage.get_blob(phb64)
-        if not row:
-            return None, None
-
-        mime_nonce, mime_enc, content_nonce, content_enc = row
-        try:
-            mime_type = self.crypto.decrypt(mime_nonce, mime_enc).decode()
-            content   = self.crypto.decrypt(content_nonce, content_enc)
-            _cache_set(phb64, self.storage.db_path, mime_type, content)
-            return mime_type, content
-        except Exception as e:
-            print(f"Decryption error for path hash {phb64[:8]}…: {e}")
-            return None, None
-
-    def store_blob(self, path: str, content: bytes, mime_type: str):
-        """Encrypt and store a blob."""
-        phb64 = self._path_hash_b64(path)
-        mime_nonce, mime_enc       = self.crypto.encrypt(mime_type.encode())
-        content_nonce, content_enc = self.crypto.encrypt(content)
-        self.storage.store_blob(phb64, mime_nonce, mime_enc, content_nonce, content_enc)
-        _cache_invalidate(phb64, self.storage.db_path)
-
-    def delete_blob(self, path: str) -> bool:
-        """Delete a blob. Returns True if it existed."""
-        phb64 = self._path_hash_b64(path)
-        deleted = self.storage.delete_blob(phb64)
-        if deleted:
-            _cache_invalidate(phb64, self.storage.db_path)
-        return deleted
-
-    # ------------------------------------------------------------------
-    # Lock / write-protection
-    # ------------------------------------------------------------------
-
-    def is_locked(self) -> bool:
-        mime, _ = self.get_blob(LOCK_PATH)
-        return mime is not None
-
-    def create_lock(self, username: str, write_password: str) -> bool:
-        """Create a write lock. Returns False if already locked."""
-        if self.is_locked():
-            return False
-        write_key   = CryptoManager.derive_write_key(username, write_password)
-        lock_secret = secrets.token_bytes(32)
-        write_proof = CryptoManager.compute_write_proof(write_key, lock_secret)
-        payload = {
-            "lock_secret": lock_secret.hex(),
-            "write_proof": write_proof.hex(),
-        }
-        self.store_blob(LOCK_PATH, json.dumps(payload).encode(), "application/json")
+def ws_revoke(token: str):
+    with _ws_lock: _write_sessions.pop(token, None)
+
+# ── Crypto ───────────────────────────────────────────────────────────────────
+
+def derive_session_token(username: str, password: str) -> bytes:
+    """Expensive (PBKDF2, 100k rounds). Called once at login."""
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                     salt=STATIC_SALT, iterations=100_000)
+    return kdf.derive(f"{username}:{password}".encode())
+
+def derive_write_key(username: str, write_password: str) -> bytes:
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                     salt=STATIC_SALT, iterations=100_000)
+    return kdf.derive(f"write:{username}:{write_password}".encode())
+
+def session_enc_key(token: bytes) -> bytes:
+    return hashlib.sha256(b"enc:" + token).digest()
+
+def session_namespace_id(token: bytes) -> bytes:
+    """Stable namespace identifier, derived separately from the enc key."""
+    return hashlib.sha256(b"ns:" + token).digest()
+
+def path_hash(enc_key: bytes, path: str) -> str:
+    """Base64-encoded SHA-256 of (path, enc_key). Used as DB primary key."""
+    h = hashlib.sha256(f"{path}:{enc_key.hex()}".encode()).digest()
+    return b64encode(h).decode()
+
+def encrypt(key: bytes, data: bytes) -> tuple[bytes, bytes]:
+    nonce = secrets.token_bytes(12)
+    return nonce, ChaCha20Poly1305(key).encrypt(nonce, data, None)
+
+def decrypt(key: bytes, nonce: bytes, ct: bytes) -> bytes:
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+
+def db():
+    conn = sqlite3.connect("blobs.sqlite3")
+    conn.execute("""CREATE TABLE IF NOT EXISTS blobs (
+        path_hash  TEXT PRIMARY KEY,
+        mime_nonce BLOB, mime_enc BLOB,
+        data_nonce BLOB, data_enc BLOB
+    )""")
+    return conn
+
+def db_get(phash: str):
+    with db() as c:
+        return c.execute("SELECT mime_nonce,mime_enc,data_nonce,data_enc "
+                         "FROM blobs WHERE path_hash=?", (phash,)).fetchone()
+
+def db_put(phash, mn, me, dn, de):
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO blobs VALUES (?,?,?,?,?)",
+                  (phash, mn, me, dn, de))
+
+def db_del(phash: str) -> bool:
+    with db() as c:
+        return c.execute("DELETE FROM blobs WHERE path_hash=?",
+                         (phash,)).rowcount > 0
+
+# ── Session helpers ───────────────────────────────────────────────────────────
+
+def get_token() -> bytes | None:
+    """Extract and validate the session token from the request cookie."""
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if not cookie: return None
+    try:
+        token = b64decode(cookie)
+        return token if len(token) == 32 else None
+    except Exception:
+        return None
+
+def has_write(token: bytes) -> bool:
+    """True if the current request has write access to this namespace."""
+    if not blob_get(token, LOCK_PATH)[0]:   # not locked -> always writable
         return True
+    wt = request.cookies.get(WRITE_COOKIE)
+    return bool(wt and ws_check(wt, session_namespace_id(token)))
 
-    def verify_write_password(self, username: str, write_password: str) -> bool:
-        """Return True if write_password is correct for this lock."""
-        mime, content = self.get_blob(LOCK_PATH)
-        if not mime:
-            return False
-        try:
-            payload     = json.loads(content.decode())
-            lock_secret = bytes.fromhex(payload["lock_secret"])
-            stored_proof = bytes.fromhex(payload["write_proof"])
-            write_key   = CryptoManager.derive_write_key(username, write_password)
-            computed    = CryptoManager.compute_write_proof(write_key, lock_secret)
-            return hmac.compare_digest(stored_proof, computed)
-        except Exception:
-            return False
+def get_username() -> str:
+    return request.cookies.get("bs_user", "")
 
-    def remove_lock(self):
-        """Remove the write lock entirely."""
-        self.delete_blob(LOCK_PATH)
+# ── Blob get / put / del (with cache) ────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Index
-    # ------------------------------------------------------------------
+def blob_get(token: bytes, path: str) -> tuple:
+    key   = session_enc_key(token)
+    phash = path_hash(key, path)
+    cached = cache_get(phash)
+    if cached: return cached
+    row = db_get(phash)
+    if not row: return None, None
+    try:
+        mime = decrypt(key, row[0], row[1]).decode()
+        data = decrypt(key, row[2], row[3])
+        cache_set(phash, (mime, data))
+        return mime, data
+    except Exception:
+        return None, None
 
-    def get_index(self) -> dict:
-        """Return the index dict, or a fresh empty one."""
-        mime, content = self.get_blob(INDEX_PATH)
-        if mime:
-            try:
-                return json.loads(content.decode())
-            except Exception:
-                pass
-        return {"version": 2, "files": {}}
+def blob_put(token: bytes, path: str, data: bytes, mime: str):
+    key   = session_enc_key(token)
+    phash = path_hash(key, path)
+    mn, me = encrypt(key, mime.encode())
+    dn, de = encrypt(key, data)
+    db_put(phash, mn, me, dn, de)
+    cache_del(phash)
 
-    def save_index(self, index: dict):
-        self.store_blob(INDEX_PATH, json.dumps(index).encode(), "application/json")
+def blob_del(token: bytes, path: str) -> bool:
+    key   = session_enc_key(token)
+    phash = path_hash(key, path)
+    ok = db_del(phash)
+    if ok: cache_del(phash)
+    return ok
 
-    def update_index(self, add_path: str = None, remove_path: str = None,
-                     size: int = None):
-        index = self.get_index()
-        files = index.setdefault("files", {})
+# ── Index helpers ─────────────────────────────────────────────────────────────
 
-        if add_path:
-            files[add_path] = {
-                "uploaded": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                "size": _format_size(size) if size is not None else "?",
-            }
-        if remove_path:
-            files.pop(remove_path, None)
+def index_get(token: bytes) -> dict:
+    _, content = blob_get(token, INDEX_PATH)
+    if content:
+        try: return json.loads(content)
+        except Exception: pass
+    return {"v": 2, "files": {}}
 
-        index["files"] = files
-        self.save_index(index)
+def index_update(token: bytes, add=None, remove=None, size=None):
+    idx = index_get(token)
+    if add:
+        idx["files"][add] = {
+            "uploaded": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "size": size or 0,
+        }
+    if remove:
+        idx["files"].pop(remove, None)
+    blob_put(token, INDEX_PATH, json.dumps(idx).encode(), "application/json")
 
+# ── Lock helpers ──────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def lock_get(token: bytes):
+    """Returns parsed lock payload dict, or None if not locked."""
+    _, content = blob_get(token, LOCK_PATH)
+    if not content: return None
+    try: return json.loads(content)
+    except Exception: return None
 
-def _format_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.0f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
+def lock_create(token: bytes, username: str, write_password: str):
+    wk          = derive_write_key(username, write_password)
+    lock_secret = secrets.token_bytes(32)
+    proof       = hmac.digest(wk, lock_secret, "sha256")
+    payload     = {"secret": lock_secret.hex(), "proof": proof.hex()}
+    blob_put(token, LOCK_PATH, json.dumps(payload).encode(), "application/json")
 
-
-def _get_write_token_from_request() -> str | None:
-    return request.cookies.get(WRITE_COOKIE_NAME)
-
-
-def _session_has_write(session_obj: Session) -> bool:
-    """Return True if the current request has write access."""
-    if not session_obj.is_locked():
-        return True
-    token = _get_write_token_from_request()
-    if not token:
+def lock_verify(token: bytes, username: str, write_password: str) -> bool:
+    payload = lock_get(token)
+    if not payload: return False
+    try:
+        wk       = derive_write_key(username, write_password)
+        computed = hmac.digest(wk, bytes.fromhex(payload["secret"]), "sha256")
+        return hmac.compare_digest(computed, bytes.fromhex(payload["proof"]))
+    except Exception:
         return False
-    return _check_write_session(token, session_obj.crypto.namespace_id)
 
+def lock_remove(token: bytes):
+    blob_del(token, LOCK_PATH)
 
-def send_partial_content(content: bytes, mime_type: str) -> Response:
-    """Serve content with HTTP Range support."""
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def fmt_size(n) -> str:
+    n = int(n)
+    for u in ("B","KB","MB","GB"):
+        if n < 1024: return f"{n} {u}"
+        n //= 1024
+    return f"{n} TB"
+
+def serve(content: bytes, mime: str) -> Response:
+    """Serve bytes with HTTP Range support."""
     total = len(content)
-    range_header = request.headers.get('Range')
-
-    if range_header:
+    rh    = request.headers.get("Range")
+    if rh:
         try:
-            byte_range = range_header.replace('bytes=', '').strip()
-            raw_start, raw_end = byte_range.split('-')
-            start = int(raw_start) if raw_start else 0
-            end   = int(raw_end)   if raw_end   else total - 1
-
-            if start >= total or start < 0 or end < start:
-                resp = make_response("Invalid range", 416)
-                resp.headers['Content-Range'] = f'bytes */{total}'
-                return resp
-
-            end   = min(end, total - 1)
-            chunk = content[start:end + 1]
-            resp  = make_response(chunk)
-            resp.status_code = 206
-            resp.headers['Content-Range'] = f'bytes {start}-{end}/{total}'
-            resp.headers['Content-Length'] = len(chunk)
+            s, e = rh.replace("bytes=","").split("-")
+            s = int(s) if s else 0
+            e = int(e) if e else total - 1
+            if not (0 <= s <= e < total):
+                r = make_response("Range Not Satisfiable", 416)
+                r.headers["Content-Range"] = f"bytes */{total}"
+                return r
+            chunk = content[s:e+1]
+            r = make_response(chunk, 206)
+            r.headers["Content-Range"]  = f"bytes {s}-{e}/{total}"
+            r.headers["Content-Length"] = len(chunk)
         except (ValueError, IndexError):
-            resp = make_response("Invalid range format", 416)
-            resp.headers['Content-Range'] = f'bytes */{total}'
-            return resp
+            return make_response("Bad Range", 416)
     else:
-        resp = make_response(content)
-        resp.headers['Content-Length'] = total
+        r = make_response(content)
+        r.headers["Content-Length"] = total
 
-    resp.headers['Content-Type']   = mime_type
-    resp.headers['Accept-Ranges']  = 'bytes'
-    resp.headers['Cache-Control']  = 'no-store, no-cache, must-revalidate, max-age=0'
-    resp.headers['Pragma']         = 'no-cache'
-    resp.headers['Expires']        = '0'
-    resp.headers['Access-Control-Allow-Origin']  = '*'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, PUT, POST, OPTIONS'
-    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    return resp
+    r.headers.update({
+        "Content-Type":  mime,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin":  "*",
+        "Access-Control-Allow-Methods": "GET, PUT, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    })
+    return r
 
+# Minimal CSS shared across all pages
+CSS = """
+body{font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;padding:16px;background:#f5f5f5}
+.box{background:#fff;padding:28px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+h1{margin-top:0;font-size:20px}h2{font-size:15px;margin-top:20px;color:#444}
+p,li{color:#555;line-height:1.5;font-size:14px}
+input{width:100%;padding:9px;margin:5px 0;box-sizing:border-box;border:1px solid #ddd;border-radius:4px;font-size:14px}
+input:focus{outline:none;border-color:#07c}
+button{width:100%;padding:9px;margin-top:5px;background:#07c;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px}
+button:hover{background:#005fa3}button.d{background:#c00}button.d:hover{background:#900}
+button.sm{width:auto;padding:3px 10px;font-size:12px;margin:0}
+a{color:#07c}code{background:#f4f4f4;padding:1px 5px;border-radius:3px;font-size:12px}
+pre{background:#f4f4f4;padding:10px;border-radius:4px;font-size:12px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:7px 5px;border-bottom:1px solid #eee;text-align:left}
+th{font-size:11px;color:#999}.nav{margin-bottom:16px;font-size:13px}.nav a{margin-right:14px}
+.ok{color:#1a6b2a;background:#e6f4ea;padding:7px 10px;border-radius:4px;font-size:13px;margin-top:8px}
+.err{color:#8b1a1a;background:#fdecea;padding:7px 10px;border-radius:4px;font-size:13px;margin-top:8px}
+"""
 
-# ---------------------------------------------------------------------------
-# Routes — auth
-# ---------------------------------------------------------------------------
+def page(title, body, nav=True):
+    nav_html = '<div class="nav"><a href="/_/admin">⚙ Admin</a><a href="/_/logout">Logout</a></div>' if nav else ""
+    return f'<!DOCTYPE html><html><head><title>{title}</title><style>{CSS}</style></head>' \
+           f'<body>{nav_html}<div class="box">{body}</div></body></html>'
 
-@app.route('/_/login', methods=['GET', 'POST'])
+# ── Routes: auth ──────────────────────────────────────────────────────────────
+
+@app.route("/_/login", methods=["GET", "POST"])
 def login():
-    next_url = request.args.get('next', '/_/index')
-
-    if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        password = request.form.get('password', '')
+    next_url = request.args.get("next", "/_/admin")
+    error = ""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        invite   = request.form.get("invite", "").strip()
         if username and password:
-            token      = CryptoManager.derive_session_token(username, password)
-            session_obj = Session(token)
-            response   = redirect(next_url)
-            session_obj.set_cookie(response)
-            # Store username in a plain, non-secret cookie for display purposes only
-            response.set_cookie('blob_username', username,
-                                max_age=COOKIE_MAX_AGE, httponly=False, samesite='Lax')
-            return response
+            token = derive_session_token(username, password)
+            if INVITE_TOKEN:
+                _, existing = blob_get(token, INDEX_PATH)
+                if existing is None and invite != INVITE_TOKEN:
+                    error = "Invalid invite token."
+            if not error:
+                resp = redirect(next_url)
+                resp.set_cookie(SESSION_COOKIE, b64encode(token).decode(),
+                                max_age=COOKIE_AGE, httponly=True, samesite="Lax",
+                                secure=False)  # ⚠ set secure=True in production — cookie IS the enc key
+                resp.set_cookie("bs_user", username, max_age=COOKIE_AGE, samesite="Lax")
+                return resp
+        else:
+            error = "Username and password required."
 
-    return render_template_string(HtmlAssets.LOGIN_FORM, next_url=next_url)
+    invite_field = f'<input name="invite" placeholder="Invite token">' if INVITE_TOKEN else ""
+    err_html     = f'<p class="err">{error}</p>' if error else ""
+    body = f"""<h1>🔐 Login</h1>
+<p>Each username+password opens a unique encrypted namespace.</p>
+{err_html}
+<form method="POST" action="/_/login?next={next_url}">
+  <input name="username" placeholder="Username" required autofocus>
+  <input type="password" name="password" placeholder="Password" required>
+  {invite_field}
+  <button onclick="this.disabled=true;this.textContent='Logging in…';this.form.submit()">Login</button>
+</form>
+<p style="font-size:12px;color:#999;margin-top:12px">
+  Different credentials = completely separate, indistinguishable namespaces.
+</p>"""
+    return page("Login", body, nav=False)
 
 
-@app.route('/_/logout')
+@app.route("/_/logout")
 def logout():
-    write_token = _get_write_token_from_request()
-    if write_token:
-        _revoke_write_session(write_token)
-    _cache_clear()
-    resp = make_response(render_template_string(HtmlAssets.LOGOUT_PAGE))
-    resp.set_cookie(COOKIE_NAME, '', expires=0)
-    resp.set_cookie(WRITE_COOKIE_NAME, '', expires=0)
-    resp.set_cookie('blob_username', '', expires=0)
+    wt = request.cookies.get(WRITE_COOKIE)
+    if wt: ws_revoke(wt)
+    cache_clear()
+    resp = redirect("/_/login")
+    for c in (SESSION_COOKIE, WRITE_COOKIE, "bs_user"):
+        resp.set_cookie(c, "", expires=0)
     return resp
 
+# ── Routes: admin (index + lock management) ───────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Routes — access control (replaces separate lock/unlock routes)
-# ---------------------------------------------------------------------------
+@app.route("/_/admin", methods=["GET", "POST"])
+def admin():
+    token = get_token()
+    if not token: return redirect("/_/login?next=/_/admin")
 
-@app.route('/_/readonly', methods=['GET', 'POST'])
-def readonly():
-    session_obj = Session.from_request()
-    if not session_obj:
-        return redirect('/_/login?next=/_/readonly')
+    msg = ""; msg_cls = "ok"
 
-    locked       = session_obj.is_locked()
-    write_enabled = _session_has_write(session_obj) and locked
-    message      = None
-    error        = False
-    response     = None
+    if request.method == "POST":
+        action   = request.form.get("action", "")
+        username = get_username()
+        wp       = request.form.get("wp", "")
 
-    if request.method == 'POST':
-        action         = request.form.get('action', '')
-        write_password = request.form.get('write_password', '')
-        username       = request.cookies.get('blob_username', '')
-
-        if action == 'lock':
-            wp2 = request.form.get('write_password2', '')
-            if write_password != wp2:
-                message = "Passwords do not match."
-                error   = True
-            elif not write_password:
-                message = "Write password cannot be empty."
-                error   = True
+        if action == "lock":
+            wp2 = request.form.get("wp2", "")
+            if not wp:                  msg, msg_cls = "Write password cannot be empty.", "err"
+            elif wp != wp2:             msg, msg_cls = "Passwords do not match.", "err"
+            elif lock_get(token):       msg, msg_cls = "Already locked.", "err"
             else:
-                session_obj.create_lock(username, write_password)
-                locked  = True
-                message = "Namespace locked."
+                lock_create(token, username, wp)
+                msg = "Namespace locked."
 
-        elif action == 'unlock':
-            if session_obj.verify_write_password(username, write_password):
-                token = _create_write_session(session_obj.crypto.namespace_id)
-                resp  = make_response(redirect('/_/readonly'))
-                resp.set_cookie(WRITE_COOKIE_NAME, token,
-                                max_age=COOKIE_MAX_AGE, httponly=True, samesite='Lax')
+        elif action == "unlock":
+            if lock_verify(token, username, wp):
+                wt   = ws_create(session_namespace_id(token))
+                resp = redirect("/_/admin")
+                resp.set_cookie(WRITE_COOKIE, wt, max_age=COOKIE_AGE,
+                                httponly=True, samesite="Lax")
                 return resp
             else:
-                message = "Incorrect write password."
-                error   = True
+                msg, msg_cls = "Incorrect write password.", "err"
 
-        elif action == 'relock':
-            write_token = _get_write_token_from_request()
-            if write_token:
-                _revoke_write_session(write_token)
-            write_enabled = False
-            message = "Write access revoked for this session."
-            response = make_response(
-                render_template_string(HtmlAssets.READONLY_PAGE,
-                                       locked=locked, write_enabled=write_enabled,
-                                       message=message, error=error)
-            )
-            response.set_cookie(WRITE_COOKIE_NAME, '', expires=0)
-            return response
+        elif action == "relock":
+            wt = request.cookies.get(WRITE_COOKIE)
+            if wt: ws_revoke(wt)
+            resp = redirect("/_/admin")
+            resp.set_cookie(WRITE_COOKIE, "", expires=0)
+            return resp
 
-        elif action == 'remove_lock':
-            if session_obj.verify_write_password(username, write_password):
-                session_obj.remove_lock()
-                write_token = _get_write_token_from_request()
-                if write_token:
-                    _revoke_write_session(write_token)
-                locked        = False
-                write_enabled = False
-                message = "Lock removed. Namespace is now fully writable."
-                response = make_response(
-                    render_template_string(HtmlAssets.READONLY_PAGE,
-                                           locked=locked, write_enabled=write_enabled,
-                                           message=message, error=error)
-                )
-                response.set_cookie(WRITE_COOKIE_NAME, '', expires=0)
-                return response
+        elif action == "remove_lock":
+            if lock_verify(token, username, wp):
+                lock_remove(token)
+                wt = request.cookies.get(WRITE_COOKIE)
+                if wt: ws_revoke(wt)
+                resp = redirect("/_/admin")
+                resp.set_cookie(WRITE_COOKIE, "", expires=0)
+                return resp
             else:
-                message = "Incorrect write password."
-                error   = True
+                msg, msg_cls = "Incorrect write password.", "err"
 
-    return render_template_string(
-        HtmlAssets.READONLY_PAGE,
-        locked=locked,
-        write_enabled=write_enabled,
-        message=message,
-        error=error
-    )
+    locked    = bool(lock_get(token))
+    can_write = has_write(token)
+    idx       = index_get(token)
+    files     = sorted(idx.get("files", {}).items())
 
+    # file table
+    if files:
+        rows = "".join(
+            f'<tr id="r{i}"><td><a href="/{p}">{p}</a></td>'
+            f'<td>{fmt_size(m.get("size",0))}</td>'
+            f'<td>{m.get("uploaded","")}</td>'
+            f'<td><button class="sm d" onclick="del(\'{p}\',\'r{i}\')">✕</button></td></tr>'
+            for i,(p,m) in enumerate(files)
+        )
+        file_table = f"<table><tr><th>Path</th><th>Size</th><th>Uploaded</th><th></th></tr>{rows}</table>"
+    else:
+        file_table = "<p><em>No files yet.</em></p>"
 
-# ---------------------------------------------------------------------------
-# Routes — index / file manager
-# ---------------------------------------------------------------------------
-
-@app.route('/_/index', methods=['GET'])
-def view_index():
-    session_obj = Session.from_request()
-    if not session_obj:
-        return redirect('/_/login?next=/_/index')
-
-    index = session_obj.get_index()
-    files = [
-        {"path": path, **meta}
-        for path, meta in sorted(index.get("files", {}).items())
-    ]
-
-    return render_template_string(
-        HtmlAssets.INDEX_PAGE,
-        files=files,
-        locked=session_obj.is_locked(),
-        write_enabled=_session_has_write(session_obj),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Routes — blob get / put
-# ---------------------------------------------------------------------------
-
-@app.route('/', methods=['GET'])
-def get_root():
-    return get_blob('index.html')
-
-@app.route('/', methods=['PUT', 'POST'])
-def put_root():
-    return put_blob('index.html')
-
-@app.route('/<path:blob_path>', methods=['GET'])
-def get_blob(blob_path):
-    session_obj = Session.from_request()
-    if not session_obj:
-        return redirect(f'/_/login?next=/{blob_path}')
-
-    mime_type, content = session_obj.get_blob(blob_path)
-    if not mime_type:
-        return render_template_string(HtmlAssets.NOT_FOUND_PAGE, path=blob_path), 404
-
-    return send_partial_content(content, mime_type)
-
-
-@app.route('/<path:blob_path>', methods=['PUT', 'POST'])
-def put_blob(blob_path):
-    session_obj = Session.from_request()
-    if not session_obj:
-        return redirect(f'/_/login?next=/{blob_path}')
-
-    # Protect internal reserved paths
-    if blob_path in RESERVED_PATHS:
-        return "Path is reserved", 403
-
-    # Enforce write lock
-    if not _session_has_write(session_obj):
-        return "Namespace is locked (read-only). Visit /_/readonly to unlock.", 403
-
-    content   = request.get_data()
-    mime_type = request.content_type or 'application/octet-stream'
-
-    # Empty body = delete
-    if len(content) == 0:
-        deleted = session_obj.delete_blob(blob_path)
-        if deleted:
-            session_obj.update_index(remove_path=blob_path)
-            return '', 204
+    # lock section
+    locked_label = "🔒 Locked" + (" + write unlocked" if can_write else "") if locked else "✏️ Unlocked"
+    if locked:
+        if can_write:
+            lock_html = """<form method="POST"><input type="hidden" name="action" value="relock">
+                <button class="d">Revoke write access</button></form>
+                <form method="POST" style="margin-top:8px"><input type="hidden" name="action" value="remove_lock">
+                <input type="password" name="wp" placeholder="Write password">
+                <button class="d">Remove lock entirely</button></form>"""
         else:
-            return "Blob not found", 404
+            lock_html = """<form method="POST"><input type="hidden" name="action" value="unlock">
+                <input type="password" name="wp" placeholder="Write password" required>
+                <button>Unlock writes for this session</button></form>"""
+    else:
+        lock_html = """<form method="POST"><input type="hidden" name="action" value="lock">
+            <input type="password" name="wp"  placeholder="Write password" required>
+            <input type="password" name="wp2" placeholder="Confirm write password" required>
+            <button>Lock namespace</button></form>"""
 
-    session_obj.store_blob(blob_path, content, mime_type)
-    session_obj.update_index(add_path=blob_path, size=len(content))
-    return make_response(f"Stored /{blob_path}", 201)
+    msg_html = f'<p class="{msg_cls}">{msg}</p>' if msg else ""
 
+    body = f"""<h1>Admin &nbsp;<small style="font-weight:normal;font-size:14px;color:#888">{get_username()}</small></h1>
+<p style="font-size:13px">{locked_label}</p>
+{msg_html}
+<h2>Files</h2>{file_table}
+<h2>Upload</h2>
+<input type="file" id="fi">
+<input id="pi" placeholder="Path (defaults to filename)">
+<button onclick="upload()">Upload</button>
+<h2>Access control</h2>
+{lock_html}
+<script>
+async function del(path,rowId){{
+  if(!confirm("Delete /"+path+"?"))return;
+  const r=await fetch("/"+path,{{method:"PUT",body:""}});
+  if(r.status===204)document.getElementById(rowId)?.remove();
+  else alert("Failed: "+r.statusText);
+}}
+async function upload(){{
+  const f=document.getElementById("fi").files[0];if(!f)return alert("Choose a file.");
+  const path=(document.getElementById("pi").value.trim()||f.name).replace(/^\\/+/,"");
+  const r=await fetch("/"+path,{{method:"PUT",body:f,headers:{{"Content-Type":f.type||"application/octet-stream"}}}});
+  if(r.ok)location.reload();else alert("Upload failed: "+(await r.text()));
+}}
+</script>"""
 
-# ---------------------------------------------------------------------------
-# Error handlers
-# ---------------------------------------------------------------------------
+    return page("Admin", body)
 
-@app.errorhandler(404)
-def not_found(e):
-    session_obj = Session.from_request()
-    if not session_obj:
-        return redirect(f'/_/login?next={request.path}')
+# ── Routes: blobs ─────────────────────────────────────────────────────────────
 
-    path = request.path.lstrip('/')
-    if not path or path.startswith('_/'):
-        return "Not found", 404
+@app.route("/", methods=["GET"])
+def root_get(): return blob_get_route("index.html")
 
-    return render_template_string(HtmlAssets.NOT_FOUND_PAGE, path=path), 404
+@app.route("/", methods=["PUT", "POST"])
+def root_put(): return blob_put_route("index.html")
 
+@app.route("/<path:p>", methods=["GET"])
+def blob_get_route(p):
+    token = get_token()
+    if not token: return redirect(f"/_/login?next=/{p}")
+    mime, data = blob_get(token, p)
+    if not mime:
+        body = (f"<h1>404 — Not Found</h1><p>No blob at <code>/{p}</code>.</p>"
+                f'<input type="file" id="fi">'
+                f'<button onclick="upload()">Upload to /{p}</button>'
+                f'<script>async function upload(){{'
+                f'const f=document.getElementById("fi").files[0];if(!f)return;'
+                f'const r=await fetch("/{p}",{{method:"PUT",body:f,'
+                f'headers:{{"Content-Type":f.type||"application/octet-stream"}}}});'
+                f'if(r.ok)location.reload();else alert("Failed: "+(await r.text()));}}</script>')
+        return page(f"404 — {p}", body), 404
+    return serve(data, mime)
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+@app.route("/<path:p>", methods=["PUT", "POST"])
+def blob_put_route(p):
+    token = get_token()
+    if not token: return redirect(f"/_/login?next=/{p}")
+    if p in RESERVED: return "Reserved path", 403
+    if not has_write(token): return "Read-only. Visit /_/admin to unlock.", 403
+    data = request.get_data()
+    if not data:
+        ok = blob_del(token, p)
+        if ok: index_update(token, remove=p)
+        return ("", 204) if ok else ("Not found", 404)
+    blob_put(token, p, data, request.content_type or "application/octet-stream")
+    index_update(token, add=p, size=len(data))
+    return f"Stored /{p}", 201
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 60)
-    print("🔐 Encrypted Blob Storage Server")
-    print("=" * 60)
-    print(f"\n  Home:   http://localhost:5000/_/index")
-    print(f"  Login:  http://localhost:5000/_/login")
-    print(f"  Access: http://localhost:5000/_/readonly")
-    print("\n  Each username+password = isolated encrypted namespace")
-    print("\n  curl quickstart:")
-    print("    curl -c c.txt -d 'username=alice&password=secret' http://localhost:5000/_/login")
-    print("    curl -b c.txt -X PUT --data-binary @file.mp4 \\")
-    print("         -H 'Content-Type: video/mp4' http://localhost:5000/videos/movie.mp4")
-    print("=" * 60)
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("Encrypted Blob Storage  —  http://localhost:5000/_/admin")
+    if INVITE_TOKEN:
+        print(f"Invite token required for new namespaces: {INVITE_TOKEN}")
+    app.run(host="0.0.0.0", port=5000, debug=True)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
