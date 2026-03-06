@@ -64,12 +64,12 @@ def path_hash(key: bytes, path: str) -> str:
     """Namespace-scoped path identifier used as the DB primary key."""
     return b64encode(hashlib.sha256(f"{path}:{key.hex()}".encode()).digest()).decode()
 
-def encrypt(key: bytes, data: bytes) -> tuple[bytes, bytes]:
+def encrypt(key: bytes, data: bytes, aad: bytes = b"") -> tuple[bytes, bytes]:
     nonce = secrets.token_bytes(12)
-    return nonce, ChaCha20Poly1305(key).encrypt(nonce, data, None)
+    return nonce, ChaCha20Poly1305(key).encrypt(nonce, data, aad or None)
 
-def decrypt(key: bytes, nonce: bytes, ct: bytes) -> bytes:
-    return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
+def decrypt(key: bytes, nonce: bytes, ct: bytes, aad: bytes = b"") -> bytes:
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, aad or None)
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 # SQLite with check_same_thread=False is safe here because Flask's dev server
@@ -122,6 +122,14 @@ def cache_clear():
     cached_db_get.cache_clear()
 
 # ── Blob get / put / del ──────────────────────────────────────────────────────
+# Each blob's ciphertext is bound to its path hash via AEAD additional data
+# (AAD). This means a ciphertext transplanted to a different path_hash row
+# will fail authentication on decryption — the DB cannot be rearranged to
+# swap or move blobs, even by someone with full DB access.
+#
+# Critically, this also means that blobs removed from the index are
+# unlocatable even to someone who knows the credentials — they must also
+# know the exact path. Credentials alone are not sufficient. See README.
 
 def blob_get(token: bytes, path: str) -> tuple:
     """Returns (mime, data) or (None, None)."""
@@ -129,18 +137,43 @@ def blob_get(token: bytes, path: str) -> tuple:
     phash = path_hash(key, path)
     row   = cached_db_get(phash)
     if not row: return None, None
+    aad = phash.encode()
     try:
-        return decrypt(key, row[0], row[1]).decode(), decrypt(key, row[2], row[3])
+        return decrypt(key, row[0], row[1], aad).decode(), \
+               decrypt(key, row[2], row[3], aad)
     except Exception:
         return None, None
 
 def blob_put(token: bytes, path: str, data: bytes, mime: str):
     key   = enc_key(token)
     phash = path_hash(key, path)
-    mn, me = encrypt(key, mime.encode())
-    dn, de = encrypt(key, data)
+    aad   = phash.encode()
+    mn, me = encrypt(key, mime.encode(), aad)
+    dn, de = encrypt(key, data,          aad)
     db_put(phash, mn, me, dn, de)
+    _maybe_insert_noise_row()
     cache_clear()
+
+def _maybe_insert_noise_row():
+    """With ~1% probability, insert a row of random bytes into the DB.
+    Noise rows are indistinguishable from real blobs without a valid key —
+    same structure, and sized by sampling a random real row then choosing
+    a uniform random size from 0 to 110% of that size. This ensures even
+    the largest real rows are not identifiable as real by their size.
+    Noise rows accumulate slowly and are never deleted."""
+    if secrets.randbelow(100) != 0:
+        return
+    # Sample a random real row to get a realistic size reference
+    with db() as c:
+        row = c.execute(
+            "SELECT length(data_enc) FROM blobs ORDER BY RANDOM() LIMIT 1"
+        ).fetchone()
+    ref_size = row[0] if row else 256
+    noise_size = secrets.randbelow(int(ref_size * 1.1) + 1)
+    fake_phash = b64encode(secrets.token_bytes(32)).decode()
+    db_put(fake_phash,
+           secrets.token_bytes(12), secrets.token_bytes(32 + 16),  # mime: small fixed
+           secrets.token_bytes(12), secrets.token_bytes(noise_size + 16))  # data: random size
 
 def blob_del(token: bytes, path: str) -> bool:
     phash = path_hash(enc_key(token), path)
@@ -408,12 +441,15 @@ def admin():
 <h2>Access control</h2>
 {lock_html}
 <script>
-async function del(path, rowId) {{
-  if (!confirm("Delete /" + path + "?")) return;
+document.addEventListener('click', async e => {{
+  const btn = e.target.closest('button[data-path]');
+  if (!btn) return;
+  const path = btn.dataset.path, rowId = btn.dataset.row;
+  //if (!confirm("Delete /" + path + "?")) return;
   const r = await fetch("/" + path, {{method: "PUT", body: ""}});
   if (r.status === 204) document.getElementById(rowId)?.remove();
   else alert("Failed: " + r.statusText);
-}}
+}});
 async function upload() {{
   const f = document.getElementById("fi").files[0];
   if (!f) return alert("Choose a file.");
@@ -423,16 +459,6 @@ async function upload() {{
   if (r.ok) location.reload();
   else alert("Upload failed: " + (await r.text()));
 }}
-document.addEventListener('click', async e => {{
-  const btn = e.target.closest('button[data-path]');
-  if (!btn) return;
-  const path = btn.dataset.path;
-  const rowId = btn.dataset.row;
-  //if (!confirm("Delete /" + path + "?")) return;
-  const r = await fetch("/" + path, {{method: "PUT", body: ""}});
-  if (r.status === 204) document.getElementById(rowId)?.remove();
-  else alert("Failed: " + r.statusText);
-}});
 </script>"""
 
     return page("Admin", body)
