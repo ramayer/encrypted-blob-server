@@ -376,7 +376,7 @@ def admin():
             f'<tr id="r{i}"><td><a href="/{p}">{p}</a></td>'
             f'<td>{fmt_size(m.get("size", 0))}</td>'
             f'<td>{m.get("uploaded", "")}</td>'
-            f'<td><button class="sm d" onclick="del(\'{p}\',\'r{i}\')">✕</button></td></tr>'
+            f'<td><button class="sm d" data-path="{p}" data-row="r{i}">✕</button></td></tr>'
             for i, (p, m) in enumerate(files)
         )
         file_table = (f"<table><tr><th>Path</th><th>Size</th><th>Uploaded</th><th></th></tr>"
@@ -423,6 +423,16 @@ async function upload() {{
   if (r.ok) location.reload();
   else alert("Upload failed: " + (await r.text()));
 }}
+document.addEventListener('click', async e => {{
+  const btn = e.target.closest('button[data-path]');
+  if (!btn) return;
+  const path = btn.dataset.path;
+  const rowId = btn.dataset.row;
+  //if (!confirm("Delete /" + path + "?")) return;
+  const r = await fetch("/" + path, {{method: "PUT", body: ""}});
+  if (r.status === 204) document.getElementById(rowId)?.remove();
+  else alert("Failed: " + r.statusText);
+}});
 </script>"""
 
     return page("Admin", body)
