@@ -2,6 +2,32 @@
 
 This directory contains multiple Docker configurations for different deployment scenarios.
 
+## Corrections, an WIP.
+
+Claude suggested re-organizing the directory
+
+```claude
+docker buildx build \
+  "https://github.com/ramayer/encrypted-blob-server.git#main:docker/mitmproxy" \
+  -t encrypted-blob-server-mitm
+
+
+The part after `:` is the build context directory within the repo. Docker looks for `Dockerfile` inside that directory.
+
+For your `/docker` layout I'd suggest:
+
+docker/
+  mitmproxy/
+    Dockerfile        # self-contained, generates its own CA
+  bring-your-own-cert/
+    Dockerfile        # your new one above, expects /certs mounted
+  README.md           # brief notes on which to use when
+
+```
+
+This part still isn't working - maybe another session with a different chatbot will fix it.
+
+
 ## 🎯 Quick Start - Choose Your Setup
 
 ### 1. Self-Signed Certificate (Development/Local)
