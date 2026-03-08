@@ -41,7 +41,7 @@ SESSION_COOKIE = "bs_session"
 COOKIE_AGE     = 86400          # 24 h
 LOCK_PATH      = "_/locked"
 INDEX_PATH     = "_/index"
-RESERVED       = {LOCK_PATH, INDEX_PATH}
+RESERVED       = {LOCK_PATH}
 INVITE_TOKEN   = os.environ.get("BLOB_INVITE_TOKEN", None)
 
 # ── Crypto ────────────────────────────────────────────────────────────────────
@@ -172,7 +172,7 @@ def _maybe_insert_noise_row():
     noise_size = secrets.randbelow(int(ref_size * 1.1) + 1)
     fake_phash = b64encode(secrets.token_bytes(32)).decode()
     db_put(fake_phash,
-           secrets.token_bytes(12), secrets.token_bytes(32 + 16),  # mime: small fixed
+           secrets.token_bytes(12), secrets.randbelow(32) + 16,  # mime: small
            secrets.token_bytes(12), secrets.token_bytes(noise_size + 16))  # data: random size
 
 def blob_del(token: bytes, path: str) -> bool:
@@ -187,15 +187,25 @@ def blob_del(token: bytes, path: str) -> bool:
 # This is recoverable — the blob is still accessible by direct URL. The index
 # is advisory, not authoritative.
 
-def index_get(token: bytes) -> dict:
+def index_get(token: bytes) -> dict|None:
     _, content = blob_get(token, INDEX_PATH)
     if content:
-        try: return json.loads(content)
-        except Exception: pass
-    return {"v": 2, "files": {}}
+        try:
+            print(f"c {content}")
+
+            idx = json.loads(content)
+            print(idx)
+            if isinstance(idx, dict) and isinstance(idx.get("files"), dict):
+                return idx
+        except Exception as e:
+            print(e)
+            pass
+    return None
 
 def index_update(token: bytes, add=None, remove=None, size=None):
     idx = index_get(token)
+    if idx is None:
+        return
     if add:
         idx["files"][add] = {
             "uploaded": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
@@ -402,20 +412,23 @@ def admin():
 
     locked = lock_exists(token)
     idx    = index_get(token)
-    files  = sorted(idx.get("files", {}).items())
 
-    if files:
-        rows = "".join(
-            f'<tr id="r{i}"><td><a href="/{p}">{p}</a></td>'
-            f'<td>{fmt_size(m.get("size", 0))}</td>'
-            f'<td>{m.get("uploaded", "")}</td>'
-            f'<td><button class="sm d" data-path="{p}" data-row="r{i}">✕</button></td></tr>'
-            for i, (p, m) in enumerate(files)
-        )
-        file_table = (f"<table><tr><th>Path</th><th>Size</th><th>Uploaded</th><th></th></tr>"
-                      f"{rows}</table>")
+    if idx is not None:
+        files  = sorted(idx.get("files", {}).items())
+        if files:
+            rows = "".join(
+                f'<tr id="r{i}"><td><a href="/{p}">{p}</a></td>'
+                f'<td>{fmt_size(m.get("size", 0))}</td>'
+                f'<td>{m.get("uploaded", "")}</td>'
+                f'<td><button class="sm d" data-path="{p}" data-row="r{i}">✕</button></td></tr>'
+                for i, (p, m) in enumerate(files)
+            )
+            file_table = (f"<table><tr><th>Path</th><th>Size</th><th>Uploaded</th><th></th></tr>"
+                        f"{rows}</table>")
+        else:
+            file_table = "<p><em>No files yet.</em></p>"
     else:
-        file_table = "<p><em>No files yet.</em></p>"
+        file_table = "<p><em>Index not enabled for this account.<button onclick=\"create_index()\">Create</button></em></p>"
 
     if locked:
         lock_html = """<p>🔒 Locked — enter the write password to remove the lock.</p>
@@ -450,6 +463,13 @@ document.addEventListener('click', async e => {{
   if (r.status === 204) document.getElementById(rowId)?.remove();
   else alert("Failed: " + r.statusText);
 }});
+
+async function create_index() {{
+    for (let i = 0; i < 2; i++) {{
+        const r = await fetch("/_/index", {{method: "PUT", body: '{{"files":{{}}}}'}});
+    }}
+    location.reload();
+}}
 async function upload() {{
   const f = document.getElementById("fi").files[0];
   if (!f) return alert("Choose a file.");
@@ -477,12 +497,13 @@ def blob_get_route(p):
     if not token: return redirect(f"/_/login?next=/{p}")
     mime, data = blob_get(token, p)
     if not mime:
-        body = (f"<h1>404 — Not Found</h1><p>No blob at <code>/{p}</code>.</p>"
+        pe = p.replace("&","&amp;").replace("<","&lt;")
+        body = (f"<h1>404 — Not Found</h1><p>No blob at <code>/{pe}</code>.</p>"
                 f'<input type="file" id="fi">'
-                f'<button onclick="upload()">Upload to /{p}</button>'
+                f'<button onclick="upload()">Upload to /{pe}</button>'
                 f"<script>async function upload(){{"
                 f'const f=document.getElementById("fi").files[0];if(!f)return;'
-                f'const r=await fetch("/{p}",{{method:"PUT",body:f,'
+                f'const r=await fetch("/{pe}",{{method:"PUT",body:f,'
                 f'headers:{{"Content-Type":f.type||"application/octet-stream"}}}});'
                 f"if(r.ok)location.reload();else alert(\"Failed: \"+(await r.text()));}}</script>")
         return page(f"404 — {p}", body), 404

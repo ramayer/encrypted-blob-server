@@ -20,6 +20,7 @@ build-backend = "uv_build"
 encrypted-blob-server = "encrypted_blob_server.app:main"
 encrypted-blob-upload = "encrypted_blob_server.upload:main"
 encrypted-blob-migrate = "encrypted_blob_server.migrate:main"
+encrypted-blob-docker-entrypoint = "encrypted_blob_server.docker_entrypoint:main"
 
 [dependency-groups]
 dev = [

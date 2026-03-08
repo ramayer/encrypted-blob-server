@@ -1,110 +1,80 @@
 # Encrypted Blob Server
 
-A tiny, minimal HTTP server that stores **encrypted blobs** in SQLite and decrypts them on the fly.
+A tiny, minimal HTTP server providing encrypted file storage with unusually strong privacy properties, where **possession of credentials is not sufficient to enumerate stored files**.
+
+Each blob requires both valid credentials *and* knowledge of its exact path to retrieve. Blobs not listed in the index are cryptographically indistinguishable from non-existent paths — even to an authenticated user, even to the server operator, even to someone with a full copy of the database.
+This provides per-blob plausible deniability: a property that, to our knowledge, no prior self-hostable storage system has offered at this granularity.
 
 **Main benefits**
 
-* **Encrypted storage** — Blobs are encrypted using a key derived from the password supplied by the client. If a disk is stolen, data at rest remains encrypted.
-* **No persisted server-side secrets, including usernames or passwords** — All encrypted blobs look the same to the server admin - and they are unable to tell what accounts exists, how many accounts exist, or what blobs belong to what accounts.   There may be 30 different users with "/img/cat.jpg" in the system and the admin will have no way of knowing anything about who owns which ones, or at what paths they exist.
-* **Password‑scoped content** — the same URL path can map to different decrypted content for different passwords. This lets multiple users share the same URLs but see different content (or lets a single user host multiple sites from the same server by switching passwords).  If two users want "username: john", that's fine as long as they're using strong passwords.  (of course if they both pick password 12345 their accounts/hashes will have collisions)
-* **No complex signup** — the password itself is the namespace.  If you log in with a new username/password 
+* **No persisted server-side secrets, including usernames or passwords or encryption keys** — All encrypted blobs look the same to the server admin - and they are unable to tell what accounts exists, how many accounts exist, or what blobs belong to what accounts.
+* **Per-blob plausible deniability** — Even rubber-hose cryptanalysis that gives an attacker the complete database and every single username/password will not enable them to enumerate which blobs belong to which user. Each blob requires both valid credentials *and* knowledge of its exact path to retrieve. The database rows are opaque without the key derived from the complete (username,password,path) combination, and keys are never stored. Blobs are cryptographically indistinguishable from randomly inserted non-existent paths — even to an authenticated user, even to the server operator, even to someone with a full copy of the database.  This provides per-blob plausible deniability: a property that, to our knowledge, no prior self-hostable storage system has offered at this granularity.
+* **The server admin cannot determine what accounts exist** — usernames and passwords are never stored anywhere, not even encrypted.  A malicious operator who modifies the running code going forward still cannot retroactively decrypt previously stored blobs, because keys were never stored.
+* **Credentials alone are not sufficient to decrypt stored files** — an attacker needs both valid credentials *and* the exact path of each blob.   Even if a hacker or server admin has the database and all user's username and password, they will not be able to decript, or even be aware of, blobs that were created before their hack, unless they observe an authorized user access the blob later.
+* **The server admin cannot determine which blobs belong to which account** — all rows in the database are cryptographically indistinguishable even to someone who holds credentials for every account on the server and knows every path those accounts have ever used — and even then, noise rows mean they still cannot be certain they have found everything
+* **Encrypted storage** — blobs are encrypted with ChaCha20-Poly1305 using a key derived from username and password. If the database is stolen, data at rest remains encrypted and unreadable.
+* **Password‑scoped namespaces** — the same URL serves different content to different credentials. /img/cat.jpg decrypts to a completely different file for alice:pass1 and alice:pass2, with no way to correlate them.  If two users want "username: john", that's fine as long as they're using strong passwords (but of course if they both pick password: 12345 their accounts/hashes will have collisions).
+* **No complex signup** — the username/password itself is the namespace.  If you log in with a new username/password you get a new namespace. Password change is handled by migrating accounts.
 
 ---
 
-## Quick summary
+## Quickstart
 
-* Login: `POST /_/login` with `username` and `password` form fields. The server derives a session token and sets a secure session cookie.
-* Upload: `PUT /path/to/blob` with `Content-Type` and the body. Requires an active session (login first). The blob is encrypted and stored in SQLite.
-* Download: `GET /path/to/blob` with the same session decrypts and returns the blob. Supports `Range` requests so `<video>` elements and seeking work.
-* Logout: `GET /_/logout` clears the session cookie.
 
----
-
-## Files in this repo
-
-* `app.py` — the minimal Flask application (main server).
-* `start.sh` — entrypoint used by the Docker image to start the app, generate the mitmproxy CA, seed the CA and setup HTML as blobs, and launch mitmproxy as TLS reverse proxy.
-* `Dockerfile` — builds an image that installs the package from GitHub and `mitmproxy`, and runs the `start.sh`.
-* `pyproject.toml` — packaging config (Hatch + minimal deps).
-
----
-
-## License
-
-## ⚖️ License -- likely no traditional license or copyright applies
-
-This project was created almost entirely by a handful of large language models.
-The human contribution was minimal and mostly evaluative: initiating the idea, requesting papers, and describing qualitative behavior of the software.
-
-As a result, there may be **no copyright ownership** in the traditional legal sense — most jurisdictions require meaningful human authorship to grant copyright.
-
-Accordingly:
-
-* ⚠️ No copyright is claimed.
-* ✅ To the fullest extent allowed by law, this work is **dedicated to the public domain**.
-* 🌍 Where a legal dedication is required, this repository is released under [CC0 1.0 Universal (Public Domain Dedication)](https://creativecommons.org/publicdomain/zero/1.0/).
-
-You are free to **use, modify, copy, and redistribute** this project for any purpose, without restriction.
-
----
-
-## Running locally from `pip install` (without HTTPS)
-
-> This mode runs the Flask app on HTTP only (no TLS). It's useful for local dev and quick tests.
-
-1. Install the package (if published) or run from local source. If your package is already on GitHub as the example, you can install it like:
+### Running dev mode locally
 
 ```bash
 pip install git+https://github.com/ramayer/encrypted-blob-server@v0.9.0-rc1
-```
-
-2. Run the app (it exposes port `5000` by default):
-
-```bash
 encrypted-blob-server
-# or
-python -m blobserver.app
-# or 
-uv run encrypted-blob-server
 ```
 
-3. Use the server with `curl`:
+Visit http://localhost:5000/_/admin, log in with any username and password, and start uploading. Visiting any URL that has no content gives you an inline form to upload to that exact path. Visiting it again retrieves the content.
 
-* Login first:
+For HTTPS, see Running with Docker.
+
+## Interactive / Browser Usage
+ Visit http://localhost:5000/ , enter whatever username/password you like, and start uploading content.
+
+ Visiting any URL without content gives you a form to upload content.
+ 
+ Visiting the same URL again lets you see the content.
+
+
+## Curl/Scripted Usage Example
+
+**Generate or downnload some example images**
+
+You can use an image placeholder service or grab local images:
 
 ```bash
-curl -c cookies.txt -d 'username=alice&password=mysecret' http://127.0.0.1:5000/_/login
+curl -o cat1.jpg https://cataas.com/cat
+curl -o cat2.jpg https://cataas.com/cat
 ```
 
-* Upload a file (example: small HTML page):
-
-```bash
-curl -b cookies.txt -X PUT -H "Content-Type: text/html" --data-binary @my-page.html http://127.0.0.1:5000/
-```
-
-* Download the file (same session):
-
-```bash
-curl -b cookies.txt http://127.0.0.1:5000/ -o index.html
-```
-
-* Upload a binary (image):
+**Upload cat1.jpg under password `pass1`**
 
 ```bash
 curl -c cookies1.txt -d 'username=alice&password=pass1' http://127.0.0.1:5000/_/login
 curl -b cookies1.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat1.jpg http://127.0.0.1:5000/img/cat.jpg
 ```
 
-* Upload a second image to the *same* path but under a *different* password:
+**Upload cat2.jpg under password `pass2`**
 
 ```bash
 curl -c cookies2.txt -d 'username=alice&password=pass2' http://127.0.0.1:5000/_/login
 curl -b cookies2.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat2.jpg http://127.0.0.1:5000/img/cat.jpg
 ```
 
-Now, fetching `/img/cat.jpg` with the `pass1` session will return `cat1.jpg` and fetching it with the `pass2` session will return `cat2.jpg` — same URL, different content.
+**Fetch with `pass1` and `pass2` to confirm different content**
 
----
+```bash
+curl -b cookies1.txt http://127.0.0.1:5000/img/cat.jpg -o seen-by-pass1.jpg
+curl -b cookies2.txt http://127.0.0.1:5000/img/cat.jpg -o seen-by-pass2.jpg
+# compare file sizes or visually open them
+ls -l seen-by-pass1.jpg seen-by-pass2.jpg
+```
+
+
 
 ## Running with Docker (HTTPS via mitmproxy)
 
@@ -142,64 +112,16 @@ curl -b cookies.txt --cacert ~/encblob-mitm/mitmproxy-ca-cert.pem https://localh
 After installing the CA into your browser trust store, you can open:
 
 ```
-https://localhost:8443/_/login
+https://localhost:8443/
 ```
 
 and log in with username `setup` and password `setup` to access the setup page.
 
 > Security reminder: only install the generated development CA on machines you control. Remove it when you're done.
 
----
+**Notes & operational tips**
 
-## Example: Upload an HTML page and two different cat images (same path, different passwords)
-
-This demonstrates the password-scoped nature of the store.
-
-1. **Generate or download example images**
-
-You can use an image placeholder service or grab local images. Example using `placekitten.com` (or replace with your own images):
-
-```bash
-curl -o cat1.jpg https://cataas.com/cat
-curl -o cat2.jpg https://cataas.com/cat
-```
-
-2. **Upload cat1.jpg under password `pass1`**
-
-```bash
-curl -c cookies1.txt -d 'username=alice&password=pass1' http://127.0.0.1:5000/_/login
-curl -b cookies1.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat1.jpg http://127.0.0.1:5000/img/cat.jpg
-```
-
-3. **Upload cat2.jpg under password `pass2`**
-
-```bash
-curl -c cookies2.txt -d 'username=alice&password=pass2' http://127.0.0.1:5000/_/login
-curl -b cookies2.txt -X PUT -H "Content-Type: image/jpeg" --data-binary @cat2.jpg http://127.0.0.1:5000/img/cat.jpg
-```
-
-4. **Fetch with `pass1` and `pass2` to confirm different content**
-
-```bash
-curl -b cookies1.txt http://127.0.0.1:5000/img/cat.jpg -o seen-by-pass1.jpg
-curl -b cookies2.txt http://127.0.0.1:5000/img/cat.jpg -o seen-by-pass2.jpg
-# compare file sizes or visually open them
-ls -l seen-by-pass1.jpg seen-by-pass2.jpg
-```
-
-If you run the same steps against the Docker HTTPS server, use `https://localhost:8443/` and `--cacert ~/encblob-mitm/mitmproxy-ca-cert.pem` for curl verification.
-
-5. ** Delete **
-
-```bash
-curl -b cookies.txt -X DELETE http://localhost:5000/videos/my-video.mp4
-```
-
----
-
-## Notes & operational tips
-
-* **Persistence**: mount a host dir for the mitmproxy CA: `-v ~/encblob-mitm:/root/.mitmproxy` and optionally mount a host dir for the SQLite DB if you want data to survive container recreation.
+* **Persistence**: For Docker - mount a host dir for the mitmproxy CA: `-v ~/encblob-mitm:/root/.mitmproxy` and optionally mount a host dir for the SQLite DB if you want data to survive container recreation.
 * **Cache behaviour**: the server caches decrypted blobs in an LRU cache to speed repeated reads. The cache is cleared globally on writes.
 * **Large files**: the server decrypts the entire blob and then slices ranges. This is simple and works for typical media sizes — if you need streaming multi-GB files you should switch to chunked storage.
 * **Production**: don't use mitmproxy or generated CAs in production. Use a proper TLS certificate from a trusted CA or an internal PKI you control.
@@ -226,37 +148,7 @@ We're working on a small Python server project. Please write in a style optimise
 Before suggesting a major architectural direction, think out loud about the tradeoffs. Prefer to brainstorm before writing code when the design is still open.
 ```
 
-
 ---
-
-## Contact
-
-If you fork or maintain your own version of this, please update the README and license block to reflect your changes.
-
-Enjoy!
-
-
-
-# encrypted-blob-storage
-
-Encrypted file storage where **possession of credentials is not sufficient to enumerate stored files**.
-
-Each blob requires both valid credentials *and* knowledge of its exact path to retrieve. Blobs not listed in the index are cryptographically indistinguishable from non-existent paths — even to an authenticated user, even to the server operator, even to someone with a full copy of the database.
-
-This provides per-blob plausible deniability: a property that, to our knowledge, no prior self-hostable storage system has offered at this granularity.
-
----
-
-## The core idea
-
-Most encrypted storage systems have a single threshold: get the password, get everything. Decrypt the volume and all its contents are visible.
-
-This system has two independent thresholds:
-
-1. **Credentials** — username + password, used to derive the encryption key
-2. **Path** — the exact URL of the blob
-
-Neither alone is sufficient. A user who knows only the credentials can retrieve only the blobs whose paths they already know. Blobs removed from the index become unlocatable to anyone without foreknowledge of their path — including people holding the credentials under coercion.
 
 **How it works cryptographically:**
 
@@ -272,9 +164,10 @@ Additionally, each write has a ~1% chance of inserting a row of random noise byt
 
 **The result:** even under full credential disclosure (keylogger, coercion, legal compulsion), an adversary cannot enumerate blobs whose paths they do not already know.
 
----
 
 ## Prior art
+
+Most encrypted storage systems have a single threshold: get the password, get everything. Decrypt the volume and all its contents are visible.
 
 This property has not, to our knowledge, been achieved by any prior self-hostable system at the per-blob level.
 
@@ -291,70 +184,6 @@ This property has not, to our knowledge, been achieved by any prior self-hostabl
 - Cryptographically enforced via AAD binding, not merely UI-level omission from a listing
 - No decoy content required — the indexed files naturally serve as the visible layer
 - Self-hostable, auditable, ~500 lines
-
----
-
-## Quickstart
-
-```bash
-pip install flask cryptography
-python server.py
-```
-
-Open `http://localhost:5000/_/admin` and log in with any username and password. A new namespace is created automatically on first login.
-
-### curl
-
-```bash
-# Login and save session cookie
-curl -c cookies.txt -d 'username=alice&password=secret' \
-     http://localhost:5000/_/login
-
-# Upload a file (appears in index)
-curl -b cookies.txt -X PUT --data-binary @photo.jpg \
-     -H 'Content-Type: image/jpeg' \
-     http://localhost:5000/photos/photo.jpg
-
-# Upload a file at an unguessable path (will not appear in index by default)
-UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
-curl -b cookies.txt -X PUT --data-binary @diary.txt \
-     -H 'Content-Type: text/plain' \
-     http://localhost:5000/$UUID/diary.txt
-# Store $UUID somewhere safe — losing it means losing the file
-
-# Download
-curl -b cookies.txt http://localhost:5000/photos/photo.jpg -o photo.jpg
-
-# Delete (empty body)
-curl -b cookies.txt -X PUT --data-binary '' \
-     http://localhost:5000/photos/photo.jpg
-```
-
----
-
-## Using per-blob deniability
-
-Any blob can be hidden from the index without being deleted. After hiding, it remains accessible at its URL to anyone with credentials, but is undetectable to anyone who does not know its path.
-
-```python
-import requests, json
-
-s = requests.Session()
-s.post("http://localhost:5000/_/login",
-       data={"username": "alice", "password": "secret"})
-
-# Remove a file from the index without deleting it
-idx = s.get("http://localhost:5000/_/index").json()
-idx["files"].pop("private/diary.txt", None)
-s.put("http://localhost:5000/_/index",
-      data=json.dumps(idx).encode(),
-      headers={"Content-Type": "application/json"})
-
-# The blob still exists and is retrievable:
-r = s.get("http://localhost:5000/private/diary.txt")   # 200 OK
-# But is undetectable without knowing the path:
-idx = s.get("http://localhost:5000/_/index").json()    # no mention of diary.txt
-```
 
 **For strongest protection, use unguessable paths.** If a path is guessable (`secret.txt`, `diary.txt`), an authenticated adversary can retrieve it by trying paths directly. Unguessable paths make the path itself a second factor:
 
@@ -385,6 +214,8 @@ The server prints a warning at startup if `BLOB_SALT` is not set.
 
 ---
 
+### Additional Features
+
 ## Write locking
 
 A namespace can be locked to prevent writes. When locked, all PUT requests are rejected with 403. To unlock, the write password must be provided at `/_/admin` — this removes the lock blob, making the namespace writable again. There is no "temporarily unlocked" session state: locked means locked until the lock is explicitly removed.
@@ -397,6 +228,11 @@ The lock blob stores a random secret and an HMAC proof derived from the write pa
 2. Visit `/_/admin`, set a write password, lock the namespace
 3. Share credentials freely — readers can access all blobs by URL
 4. To update: visit `/_/admin`, remove the lock, make changes, re-lock
+
+## Index generation
+
+For namespaces that care less about security, it can be inconvenient that a forgotten URL results in a blob that is lost/orphaned forever.  For such less secure namespaces, a user can upload an empty json file (`{}`) to `/_/index` and the server will start adding newly inserted blobs for that namespace into the index.  Note that this weakens security because then an admin with a username/password can find all blobs owned by that user.  
+
 
 ---
 
