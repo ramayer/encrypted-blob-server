@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the encrypted blob server
+RUN pip install --no-cache-dir \
+    "git+https://github.com/ramayer/encrypted-blob-server@v0.9.0-rc1"
+
+# Create directories
+RUN mkdir -p /data /certs
+
+# Expose HTTPS port
+EXPOSE 443
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV BLOB_DB_PATH=/data/blobs.sqlite3
+ENV CERT_FILE=/certs/cert.pem
+ENV KEY_FILE=/certs/key.pem
+
+# Volumes for persistent data and certificates
+VOLUME /data
+VOLUME /certs
+
+# Run with custom certificates
+CMD python3 -c "\
+from encrypted_blob_server import app; \
+import ssl, os; \
+ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); \
+ssl_context.load_cert_chain(os.environ['CERT_FILE'], os.environ['KEY_FILE']); \
+app.run(host='0.0.0.0', port=443, ssl_context=ssl_context, debug=False)"

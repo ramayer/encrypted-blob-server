@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  blob-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.letsencrypt
+    ports:
+      - "80:80"    # For ACME HTTP-01 challenge
+      - "443:443"  # HTTPS
+    volumes:
+      # Persist database and uploaded blobs
+      - blob-data:/data
+      # Persist Let's Encrypt certificates
+      - letsencrypt:/etc/letsencrypt
+    environment:
+      # REQUIRED: Set your domain and email
+      - CERTBOT_DOMAIN=yourdomain.com
+      - CERTBOT_EMAIL=you@example.com
+      
+      # Optional: Database path
+      - BLOB_DB_PATH=/data/blobs.sqlite3
+    restart: unless-stopped
+    # Note: Your domain must point to this server's public IP for Let's Encrypt to work
+
+volumes:
+  blob-data:
+  letsencrypt:

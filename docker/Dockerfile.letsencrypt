@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+# Install system dependencies including certbot
+RUN apt-get update && apt-get install -y \
+    git \
+    certbot \
+    cron \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the encrypted blob server
+RUN pip install --no-cache-dir \
+    "git+https://github.com/ramayer/encrypted-blob-server@v0.9.0-rc1"
+
+# Create directories
+RUN mkdir -p /data /etc/letsencrypt
+
+# Copy Let's Encrypt entrypoint script
+COPY docker/letsencrypt-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/letsencrypt-entrypoint.sh
+
+# Expose HTTP (for ACME challenge) and HTTPS
+EXPOSE 80 443
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV BLOB_DB_PATH=/data/blobs.sqlite3
+ENV CERTBOT_EMAIL=admin@example.com
+ENV CERTBOT_DOMAIN=example.com
+
+# Volumes for persistent data
+VOLUME /data
+VOLUME /etc/letsencrypt
+
+ENTRYPOINT ["/usr/local/bin/letsencrypt-entrypoint.sh"]

@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  blob-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.custom-cert
+    ports:
+      - "443:443"
+    volumes:
+      # Persist database and uploaded blobs
+      - blob-data:/data
+      
+      # Mount your certificates here
+      # Place your cert.pem and key.pem in ./certs/ directory
+      - ./certs:/certs:ro
+    environment:
+      - BLOB_DB_PATH=/data/blobs.sqlite3
+      - CERT_FILE=/certs/cert.pem
+      - KEY_FILE=/certs/key.pem
+    restart: unless-stopped
+
+volumes:
+  blob-data:

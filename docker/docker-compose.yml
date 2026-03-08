@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  blob-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "5443:5443"
+    volumes:
+      # Persist database and uploaded blobs
+      - blob-data:/data
+      # Persist certificates so they don't regenerate on restart
+      - cert-data:/root/.mitmproxy
+    environment:
+      - SERVER_HOSTNAME=localhost
+      - SERVER_PORT=5443
+      # Change to your actual hostname if accessing from network:
+      # - SERVER_HOSTNAME=blob-server.local
+    restart: unless-stopped
+
+volumes:
+  blob-data:
+  cert-data:
