@@ -32,15 +32,8 @@ Visit http://localhost:5000/_/admin, log in with any username and password, and 
 
 For HTTPS, see Running with Docker.
 
-## Interactive / Browser Usage
- Visit http://localhost:5000/ , enter whatever username/password you like, and start uploading content.
 
- Visiting any URL without content gives you a form to upload content.
- 
- Visiting the same URL again lets you see the content.
-
-
-## Curl/Scripted Usage Example
+### Curl/Scripted Usage Example
 
 **Generate or downnload some example images**
 
@@ -77,56 +70,119 @@ ls -l seen-by-pass1.jpg seen-by-pass2.jpg
 
 
 ## Running with Docker (HTTPS via mitmproxy)
+## Running with Docker (HTTPS via mitmproxy)
 
-The Docker image in this repo runs the Flask app behind **mitmproxy** which generates a local CA and serves HTTPS (reverse proxy) on port `8443`. The container's `start.sh` seeds two blobs on first run:
-
-* `/` — a small HTML page explaining installation of the CA
-* `/encrypted-blob-server-ca-cert.pem` — the mitmproxy CA PEM
-
-Both of these are uploaded into the server under the special password `setup`.
-
-**Run the container**
+The Docker image runs the server behind mitmproxy, which generates a local CA and serves HTTPS on port 5443. On first run it seeds a `setup/setup` namespace with the CA certificate and browser installation instructions.
 
 ```bash
-mkdir -p ~/encblob-mitm
-docker build -t encblob:mitm .
-docker run --rm -it -v ~/encblob-mitm:/root/.mitmproxy -p 8443:8443 --name encblob-dev encblob:mitm
+# Build directly from GitHub — no local directory needed
+docker buildx build \
+  "https://github.com/ramayer/encrypted-blob-server.git#main" \
+  -t encrypted-blob-server
+
+# Run with persistent storage
+docker run --rm -it \
+  -v /tmp/ebs-certs:/root/.mitmproxy \
+  -v /tmp/ebs-data:/data \
+  -p 5443:5443 \
+  --name ebs \
+  encrypted-blob-server:latest
 ```
 
-**Install the CA into your browser**
+Then visit `https://localhost:5443/` and log in with username `setup`, password `setup` for certificate installation instructions. Once you've trusted the CA in your browser, log in with any other credentials to create your own namespace.
 
-Once the container has generated the CA, the file will be available on the host at `~/encblob-mitm/mitmproxy-ca-cert.pem`.
+**Environment variables:**
 
-* For **Firefox**: Preferences → Privacy & Security → View Certificates → Authorities → Import → choose `mitmproxy-ca-cert.pem` and trust it for website identification.
-* For **Chrome on macOS**: open Keychain Access → Import the PEM → find the cert → set "Always Trust" for SSL → restart Chrome.
+| Variable | Default | Description |
+|---|---|---|
+| `SERVER_HOSTNAME` | `localhost` | Hostname shown in setup instructions |
+| `SERVER_PORT` | `5443` | Port shown in setup instructions |
+| `BLOB_SALT` | *(insecure default)* | Set this in production — see [Configuration](#configuration) |
+| `BLOB_DB_PATH` | `/data/blobs.sqlite3` | Path to the SQLite database |
 
-You can also download the CA from the server (it's stored as a normal blob) after logging in with the `setup` password:
+> The mitmproxy CA is a self-signed development certificate. Only install it on machines you control, and remove it when done.
 
-```bash
-curl -c cookies.txt -d 'username=setup&password=setup' http://127.0.0.1:5000/_/login
-curl -b cookies.txt --cacert ~/encblob-mitm/mitmproxy-ca-cert.pem https://localhost:8443/encrypted-blob-server-ca-cert.pem -o mitmproxy-ca-cert.pem
-```
+# Encrypted Blob Storage — Security
 
-**Open the setup page in your browser**
-
-After installing the CA into your browser trust store, you can open:
-
-```
-https://localhost:8443/
-```
-
-and log in with username `setup` and password `setup` to access the setup page.
-
-> Security reminder: only install the generated development CA on machines you control. Remove it when you're done.
-
-**Notes & operational tips**
-
-* **Persistence**: For Docker - mount a host dir for the mitmproxy CA: `-v ~/encblob-mitm:/root/.mitmproxy` and optionally mount a host dir for the SQLite DB if you want data to survive container recreation.
-* **Cache behaviour**: the server caches decrypted blobs in an LRU cache to speed repeated reads. The cache is cleared globally on writes.
-* **Large files**: the server decrypts the entire blob and then slices ranges. This is simple and works for typical media sizes — if you need streaming multi-GB files you should switch to chunked storage.
-* **Production**: don't use mitmproxy or generated CAs in production. Use a proper TLS certificate from a trusted CA or an internal PKI you control.
+Encrypted Blob Storage is built around the principles of **breach resilience** and **graceful degradation of security**. The system is architected so that breaches — of the database, of server secrets, of usernames and passwords, even of several of these simultaneously — each reveal as little as possible.  The **minimal trust surface** means no account records, usernames, or keys are ever stored server-side. The result is **partial compromise security** with genuine **defense in depth**: no realistic subset of leaked components is sufficient to decrypt stored data or even confirm that any particular account exists.   Security degrades gracefully even under partial compromise.
 
 ---
+
+## Security Properties
+
+- **No server-side account records.** Usernames, passwords, and encryption keys are never stored anywhere on the server. There is nothing to steal, subpoena, or leak.
+
+- **No account enumeration, even with full database access.** Every stored record is identified only by a keyed hash. Without credentials, an attacker with a complete database backup cannot determine how many accounts exist, who they belong to, or whether any particular account exists at all.
+
+- **Credentials alone are not sufficient to locate blobs.** Each blob's database key is derived from a combination of the encryption key *and* the file path. Even knowing a valid username and password, an attacker cannot retrieve any blob without also knowing its exact path. There is no way to enumerate files without an explicitly opted-in index.
+
+- **Different passwords mean completely separate namespaces.** `alice:password1` and `alice:password2` produce cryptographically unrelated keys and unrelated storage namespaces. Knowing a username leaks nothing about any account's contents.
+
+- **Ciphertexts are bound to their location.** Each blob is authenticated against its own path hash (AEAD additional data). A database-level attacker cannot rearrange, transplant, or swap blobs between accounts or paths — doing so causes authentication failure on decryption.
+
+- **Database theft is not sufficient for decryption.** Blobs are encrypted with a key derived from credentials *and* a server-side salt (`BLOB_SALT`). A stolen database without the salt is undecryptable. A stolen salt without the database is useless.
+
+- **Retroactive keylogging is impossible.** A malicious operator who modifies the server to log future credentials learns nothing about data stored before the hack. Past ciphertexts can only be decrypted by someone who knew the credentials at the time of storage.
+
+- **Session cookies expire and are tamper-proof.** The session cookie is HMAC-signed with a key derived from `BLOB_SALT` and carries an embedded expiry timestamp. A stolen cookie becomes useless after expiry, and cannot be forged or extended without the server secret.
+
+- **Noise rows resist traffic analysis.** Approximately 1% of writes insert indistinguishable random rows into the database, sized by sampling real rows. This prevents an attacker from inferring account activity or file counts from database size or row distribution.
+
+- **Write-locking is cryptographically enforced.** A locked namespace requires a separate write password to unlock. The lock proof is stored encrypted; there is no server-side bypass.
+
+---
+
+## How the Security Elements Work Together
+
+The system's resilience comes not from any single mechanism but from the way several layers compose.
+
+**Key derivation** is the foundation. When a user logs in, their username and password are fed into Argon2id (with a server-side salt) to produce a 32-byte token. This token never touches the database — it lives only in the session cookie and in memory during a request. The encryption key is then derived from this token via a second SHA-256 pass, further separating the session credential from the storage credential.
+
+**Path-scoped storage** is the most unusual property. Rather than storing blobs under a user ID, each blob is stored under `SHA256(path + ":" + encryption_key)`. This means the database contains no user identifiers at all — not even pseudonymous ones. Two consequences follow: first, there is no way to group records by account without the key; second, even a valid key is insufficient to find blobs without also knowing their paths. The file index (a blob at the reserved path `_/index`) is opt-in precisely because creating it trades this path-secrecy property for convenience.
+
+**AEAD binding** closes a subtle gap. Each blob's ciphertext is authenticated with its own path hash as additional data. This means a ciphertext cannot be moved to a different row in the database and successfully decrypted — the authentication tag will fail. An attacker with full read/write database access cannot reassign blobs between accounts or paths, even without knowing the key.
+
+**The two-component decryption requirement** (database + `BLOB_SALT`) means that stealing either component alone yields nothing. The database is uninterpretable without the salt; the salt is useless without the database. This is structurally similar to two-factor possession, applied to the storage layer rather than authentication.
+
+**Cookie signing** adds a time-bound layer over the derived key. The cookie contains the token, an expiry timestamp, and an HMAC over both, keyed by a derivative of `BLOB_SALT`. A stolen cookie expires naturally and cannot be extended without the server secret. Notably, this does not change the encryption model at all — it is a wrapper that addresses the distinct threat of cookie theft without introducing server-side session state.
+
+Together, these properties mean that an attacker must simultaneously possess the database, the server salt, valid credentials, *and* knowledge of at least one file path to decrypt even a single blob. No subset of these is sufficient.
+
+---
+
+## Threat Model
+
+The table below assumes an attacker has obtained the components listed and asks what remains protected.
+
+| Attacker possesses | Can decrypt blobs? | Can enumerate accounts? | Can enumerate file paths? | Notes |
+|---|---|---|---|---|
+| Database only | ✅ No | ✅ No | ✅ No | All records are opaque without `BLOB_SALT` |
+| `BLOB_SALT` only | ✅ No | ✅ No | ✅ No | No database, nothing to decrypt |
+| Database + `BLOB_SALT` | ✅ No | ✅ No | ✅ No | Still need credentials to derive keys |
+| Database + all usernames | ✅ No | ✅ No | ✅ No | Username alone doesn't determine key; password required |
+| Database + all username/password pairs | ✅ No | ⚠️ Partial | ✅ No | Can attempt decryption per account, but still need paths to locate blobs; index-enabled accounts expose paths |
+| Database + `BLOB_SALT` + all username/password pairs | ⚠️ Partial | ✅ Yes | ⚠️ Partial | Can decrypt blobs only if paths are also known; path enumeration still requires index or prior knowledge |
+| Database + `BLOB_SALT` + credentials + all file paths | ❌ Yes | ❌ Yes | ❌ Yes | Full compromise; no further protection |
+| Expired session cookie only | ✅ No | ✅ No | ✅ No | Cookie is signed and time-limited; rejected by server after expiry |
+| Valid session cookie (within expiry) | ❌ Yes (live server) | ❌ Yes (live server) | ⚠️ Only if index enabled | Can access server normally; offline decryption still requires `BLOB_SALT` |
+| Valid session cookie + database (no `BLOB_SALT`) | ✅ No | ✅ No | ✅ No | `BLOB_SALT` required to map cookie token to encryption key |
+| Future server keylog (credentials going forward) | ⚠️ Future only | ⚠️ Future only | ⚠️ Future only | Past data inaccessible; retroactive compromise impossible |
+| Web server access logs (URLs + timestamps) | ✅ No | ✅ No | ⚠️ Partial | URLs visible in logs; contents and account associations still protected. **Disable access logging in production.** |
+
+### Key to symbols
+- ✅ **Protected** — the attacker cannot achieve this goal with the listed components
+- ⚠️ **Partial** — some information may be inferred under specific conditions (noted)
+- ❌ **Compromised** — the attacker can achieve this goal
+
+### Important caveats
+
+**The file index trades security for convenience.** Users who opt in to the index at `_/index` expose their full list of file paths to anyone with their credentials. For maximum security, do not enable the index, and access files by direct URL only.
+
+**Web server access logs are outside this system's control.** By default, reverse proxies (nginx, caddy) and application servers (gunicorn) log request URLs, timestamps, and IP addresses. These logs can associate IPs with file paths and login events. For strong operational security, disable access logging or ensure logs are not retained.
+
+**Password strength is the weakest link.** The entire model depends on credentials being unguessable. Argon2id makes brute-force expensive but not impossible against weak passwords. Use strong, unique passwords.
+
+**`BLOB_SALT` must be kept secret.** It is the server's only secret. If it is lost, all data becomes permanently inaccessible. If it is stolen alongside the database, the attacker's work reduces to credential and URL guessing. Store it securely (environment variable, secrets manager) and back it up offline.
 
 ## Contributing
 

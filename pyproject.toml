@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "argon2-cffi>=25.1.0",
     "cryptography>=45.0.7",
     "flask>=3.1.2",
     "mitmproxy>=12.1.2",

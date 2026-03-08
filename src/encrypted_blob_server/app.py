@@ -25,8 +25,9 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from flask import Flask, request, make_response, redirect, Response
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
+# from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC # repalced with argon2
+# from cryptography.hazmat.primitives import hashes
+from argon2.low_level import hash_secret_raw, Type  # add this line
 
 app = Flask(__name__)
 
@@ -46,16 +47,44 @@ INVITE_TOKEN   = os.environ.get("BLOB_INVITE_TOKEN", None)
 
 # ── Crypto ────────────────────────────────────────────────────────────────────
 
+# ── Key derivation (Argon2id) ─────────────────────────────────────────────────
+# Parameters: 64MB memory, 3 iterations, parallelism 1.
+# Chosen to be ~300ms on modest hardware — adjust ARGON2_MEMORY_KB upward
+# for deployments where login latency is acceptable.
+# WARNING: changing any parameter locks out all existing accounts.
+# Migration requires running two servers side-by-side; see migrate_account script.
+
+ARGON2_TIME_COST   = int(os.environ.get("ARGON2_TIME_COST",   3))
+ARGON2_MEMORY_KB   = int(os.environ.get("ARGON2_MEMORY_KB",   65536))  # 64 MB
+ARGON2_PARALLELISM = int(os.environ.get("ARGON2_PARALLELISM", 1))
+
+def _argon2id(secret: bytes) -> bytes:
+    return hash_secret_raw(
+        secret=secret,
+        salt=STATIC_SALT[:16].ljust(16, b"\x00"),  # argon2 requires exactly 16 bytes
+        time_cost=ARGON2_TIME_COST,
+        memory_cost=ARGON2_MEMORY_KB,
+        parallelism=ARGON2_PARALLELISM,
+        hash_len=32,
+        type=Type.ID,
+    )
+
 def derive_session_token(username: str, password: str) -> bytes:
-    """Expensive (PBKDF2, 100k rounds). Called once at login."""
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
-                     salt=STATIC_SALT, iterations=100_000)
-    return kdf.derive(f"{username}:{password}".encode())
+    return _argon2id(f"{username}:{password}".encode())
 
 def derive_write_key(username: str, write_password: str) -> bytes:
-    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
-                     salt=STATIC_SALT, iterations=100_000)
-    return kdf.derive(f"write:{username}:{write_password}".encode())
+    return _argon2id(f"write:{username}:{write_password}".encode())
+
+# def derive_session_token(username: str, password: str) -> bytes:
+#     """Expensive (PBKDF2, 100k rounds). Called once at login."""
+#     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+#                      salt=STATIC_SALT, iterations=100_000)
+#     return kdf.derive(f"{username}:{password}".encode())
+
+# def derive_write_key(username: str, write_password: str) -> bytes:
+#     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+#                      salt=STATIC_SALT, iterations=100_000)
+#     return kdf.derive(f"write:{username}:{write_password}".encode())
 
 def enc_key(token: bytes) -> bytes:
     return hashlib.sha256(b"enc:" + token).digest()
@@ -247,12 +276,44 @@ def lock_remove(token: bytes):
 
 # ── Request helpers ───────────────────────────────────────────────────────────
 
+# ── Session cookie (signed, expiring wrapper around the derived key) ──────────
+# Cookie format: base64( token[32] | expiry_u32_be[4] | hmac_sha256[32] )
+# HMAC key = SHA256("cookie-hmac:" + BLOB_SALT) — derived from server secret,
+# never stored. Stolen cookie is useless after expiry without BLOB_SALT.
+# Does not protect against Threat D (cookie + DB + BLOB_SALT); that requires
+# server-side state which would undermine the no-server-secrets design.
+
+COOKIE_HMAC_KEY = hashlib.sha256(b"cookie-hmac:" + _DEFAULT_SALT).digest()
+# Recomputed after STATIC_SALT is resolved at module load — see _init_cookie_key()
+
+_cookie_hmac_key = None
+
+def _init_cookie_key():
+    global _cookie_hmac_key
+    _cookie_hmac_key = hashlib.sha256(b"cookie-hmac:" + STATIC_SALT).digest()
+
+def _make_cookie(token: bytes) -> str:
+    import struct
+    expiry = int(datetime.now(timezone.utc).timestamp()) + COOKIE_AGE
+    expiry_bytes = struct.pack(">I", expiry)
+    msg  = token + expiry_bytes
+    sig  = hmac.digest(_cookie_hmac_key, msg, "sha256")
+    return b64encode(msg + sig).decode()
+
 def get_token() -> bytes | None:
+    import struct
     cookie = request.cookies.get(SESSION_COOKIE)
     if not cookie: return None
     try:
-        token = b64decode(cookie)
-        return token if len(token) == 32 else None
+        raw = b64decode(cookie)
+        if len(raw) != 32 + 4 + 32: return None
+        token, expiry_bytes, sig = raw[:32], raw[32:36], raw[36:]
+        msg      = token + expiry_bytes
+        expected = hmac.digest(_cookie_hmac_key, msg, "sha256")
+        if not hmac.compare_digest(sig, expected): return None
+        expiry = struct.unpack(">I", expiry_bytes)[0]
+        if int(datetime.now(timezone.utc).timestamp()) > expiry: return None
+        return token
     except Exception:
         return None
 
@@ -346,7 +407,7 @@ def login():
                     error = "Invalid invite token."
             if not error:
                 resp = redirect(next_url)
-                resp.set_cookie(SESSION_COOKIE, b64encode(token).decode(),
+                resp.set_cookie(SESSION_COOKIE, _make_cookie(token),
                                 max_age=COOKIE_AGE, httponly=True, samesite="Lax",
                                 secure=False)  # ⚠ set secure=True in production — cookie IS the enc key
                 # bs_user is not secret — it's only used to derive the write key
@@ -528,6 +589,7 @@ def blob_put_route(p):
 
 def main():
     _init_db()
+    _init_cookie_key()
     if STATIC_SALT == _DEFAULT_SALT:
         print("⚠  WARNING: using default BLOB_SALT. Set the BLOB_SALT environment")
         print("   variable to a unique secret before exposing this to the internet.")
