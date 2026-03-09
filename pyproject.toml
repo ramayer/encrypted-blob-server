@@ -26,6 +26,8 @@ encrypted-blob-docker-entrypoint = "encrypted_blob_server.docker_entrypoint:main
 [dependency-groups]
 dev = [
     "encrypted-blob-server",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
 ]
 
 [tool.uv.sources]

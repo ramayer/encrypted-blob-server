@@ -174,6 +174,15 @@ The table below assumes an attacker has obtained the components listed and asks 
 - ⚠️ **Partial** — some information may be inferred under specific conditions (noted)
 - ❌ **Compromised** — the attacker can achieve this goal
 
+
+### Additional nodes from Claude:
+
+> A few notes on choices made:
+>
+>The term I landed on in the intro is "security degrades gracefully under partial compromise" — I think that phrase is clear to a non-academic reader and accurately describes the system's standout property. If you want a single memorable term for the bullet list or a tagline, "breach-resilient" is the most concise accurate label.
+>
+>The threat table has one row you might want to revisit: "Database + BLOB_SALT + all username/password pairs" is marked partial for decryption because paths are still needed. That's the system's most unusual property and arguably the one most worth highlighting to sophisticated users.
+
 ### Important caveats
 
 **The file index trades security for convenience.** Users who opt in to the index at `_/index` expose their full list of file paths to anyone with their credentials. For maximum security, do not enable the index, and access files by direct URL only.
