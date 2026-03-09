@@ -4,8 +4,12 @@ on: [push, pull_request]
 
 jobs:
   unit:
-    name: Unit & threat matrix tests
-    runs-on: ubuntu-latest
+    name: Unit & threat matrix tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,8 +20,12 @@ jobs:
       - run: uv run pytest tests/test_unit.py tests/test_threat_matrix.py -v --cov=encrypted_blob_server
 
   integration:
-    name: Integration tests
-    runs-on: ubuntu-latest
+    name: Integration tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,15 +33,32 @@ jobs:
 
       - run: uv sync --group dev
 
-      - name: Start server
+      - name: Start server (unix)
+        if: runner.os != 'Windows'
         run: |
           BLOB_SALT=$(python -c "import secrets; print(secrets.token_hex(32))") \
           uv run python -m encrypted_blob_server.app &
           echo $! > server.pid
           sleep 2
 
+      - name: Start server (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:BLOB_SALT = python -c "import secrets; print(secrets.token_hex(32))"
+          $proc = Start-Process -PassThru -NoNewWindow `
+            -FilePath "uv" `
+            -ArgumentList "run", "python", "-m", "encrypted_blob_server.app"
+          $proc.Id | Out-File -FilePath server.pid
+          Start-Sleep -Seconds 3
+
       - run: uv run pytest tests/test_integration.py -v
 
-      - name: Stop server
-        if: always()
+      - name: Stop server (unix)
+        if: always() && runner.os != 'Windows'
         run: kill $(cat server.pid)
+
+      - name: Stop server (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: Stop-Process -Id (Get-Content server.pid)
