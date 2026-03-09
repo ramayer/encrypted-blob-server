@@ -213,6 +213,7 @@ class TestIndex:
         self._make_index(token)
         server.index_update(token, add="img/cat.jpg", size=1234)
         idx = server.index_get(token)
+        assert idx is not None
         assert "img/cat.jpg" in idx["files"]
         assert idx["files"]["img/cat.jpg"]["size"] == 1234
 
@@ -222,7 +223,9 @@ class TestIndex:
                         json.dumps({"files": {"a.txt": {"size": 1, "uploaded": "2024-01-01 00:00"}}}).encode(),
                         "application/json")
         server.index_update(token, remove="a.txt")
-        assert "a.txt" not in server.index_get(token)["files"]
+        idx = server.index_get(token)
+        assert idx is not None
+        assert "a.txt" not in idx["files"]
 
     def test_update_noop_without_index(self):
         token = token_for(*rand_creds())
@@ -298,11 +301,13 @@ class TestCookie:
         assert self._request_with_cookie(cookie) is None
 
     def test_tampered_token_rejected(self):
+        import base64
         token = secrets.token_bytes(32)
         cookie = server._make_cookie(token)
-        raw = bytearray(b64encode.__module__ and __import__('base64').b64decode(cookie))
+        # LOL, claude:
+        #raw = bytearray(b64encode.__module__ and __import__('base64').b64decode(cookie))
+        raw = bytearray(base64.b64decode(cookie))
         raw[0] ^= 0xFF
-        import base64
         tampered = base64.b64encode(bytes(raw)).decode()
         assert self._request_with_cookie(tampered) is None
 
