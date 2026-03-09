@@ -29,6 +29,11 @@ jobs:
         run: |
           BLOB_SALT=$(python -c "import secrets; print(secrets.token_hex(32))") \
           uv run python -m encrypted_blob_server.app &
+          echo $! > server.pid
           sleep 2
 
       - run: uv run pytest tests/test_integration.py -v
+
+      - name: Stop server
+        if: always()
+        run: kill $(cat server.pid)
