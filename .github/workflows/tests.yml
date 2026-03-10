@@ -49,7 +49,7 @@ jobs:
           $salt = python -c "import secrets; print(secrets.token_hex(32))"
           $salt | Out-File -FilePath server.salt -NoNewline
           $proc = Start-Process -PassThru -NoNewWindow `
-            -FilePath "python" `
+            -FilePath ".venv\Scripts\python.exe" `
             -ArgumentList "-m", "encrypted_blob_server.app" `
             -Environment @{ BLOB_SALT = $salt; FLASK_DEBUG = "0"; PATH = $env:PATH }
           $proc.Id | Out-File -FilePath server.pid -NoNewline
