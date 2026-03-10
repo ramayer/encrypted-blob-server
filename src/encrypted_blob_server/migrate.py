@@ -36,6 +36,11 @@ def migrate(src_url, src_session, dst_url, dst_session, paths: list[str]):
     ok = []; failed = []; skipped = []
 
     for path in paths:
+
+        if path == '_/index':
+            print("skipping _/index")
+            continue
+
         # Fetch from source
         r = src_session.get(f"{src_url}/{path}")
         if r.status_code != 200:
