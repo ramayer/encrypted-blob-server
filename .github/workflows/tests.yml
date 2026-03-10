@@ -55,6 +55,8 @@ jobs:
           Start-Sleep -Seconds 3
 
       - run: uv run pytest tests/test_integration.py -v
+        env:
+          BASE_URL: http://127.0.0.1:5000
 
       - name: Stop server (unix)
         if: always() && runner.os != 'Windows'
@@ -63,4 +65,7 @@ jobs:
       - name: Stop server (Windows)
         if: always() && runner.os == 'Windows'
         shell: pwsh
-        run: Stop-Process -Id (Get-Content server.pid)
+        run: |
+          Get-NetTCPConnection -LocalPort 5000 -State Listen |
+            Select-Object -ExpandProperty OwningProcess |
+            ForEach-Object { Stop-Process -Id $_ -Force }
