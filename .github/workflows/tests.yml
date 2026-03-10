@@ -55,12 +55,11 @@ jobs:
           env['FLASK_DEBUG'] = '0'
 
           proc = subprocess.Popen(
-              [sys.executable, '-m', 'encrypted_blob_server.app'],
+              ['uv', 'run', 'python', '-m', 'encrypted_blob_server.app'],
               env=env,
           )
           open('server.pid', 'w').write(str(proc.pid))
 
-          # Poll until port accepts connections
           for _ in range(30):
               try:
                   s = socket.create_connection(('127.0.0.1', 5000), timeout=1)
