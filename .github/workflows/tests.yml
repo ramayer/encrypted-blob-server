@@ -47,23 +47,31 @@ jobs:
         shell: pwsh
         run: |
           $salt = python -c "import secrets; print(secrets.token_hex(32))"
-          $salt | Out-File -FilePath server.salt -NoNewline
-          $proc = Start-Process -PassThru -NoNewWindow `
-            -FilePath ".venv\Scripts\python.exe" `
-            -ArgumentList "-m", "encrypted_blob_server.app" `
-            -Environment @{ BLOB_SALT = $salt; FLASK_DEBUG = "0"; PATH = $env:PATH }
-          $proc.Id | Out-File -FilePath server.pid -NoNewline
-          # Poll until port is open
-          $timeout = 30; $elapsed = 0
-          while ($elapsed -lt $timeout) {
-            try {
-              $tcp = [System.Net.Sockets.TcpClient]::new("127.0.0.1", 5000)
-              $tcp.Close(); break
-            } catch {
-              Start-Sleep -Seconds 1; $elapsed++
-            }
-          }
-          Write-Host "Server ready after $elapsed seconds"
+          python -c "
+          import subprocess, os, sys, time, socket
+
+          env = os.environ.copy()
+          env['BLOB_SALT'] = '$salt'
+          env['FLASK_DEBUG'] = '0'
+
+          proc = subprocess.Popen(
+              [sys.executable, '-m', 'encrypted_blob_server.app'],
+              env=env,
+          )
+          open('server.pid', 'w').write(str(proc.pid))
+
+          # Poll until port accepts connections
+          for _ in range(30):
+              try:
+                  s = socket.create_connection(('127.0.0.1', 5000), timeout=1)
+                  s.close()
+                  print('Server ready')
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(1)
+          print('Server failed to start')
+          sys.exit(1)
+          "
 
 
       - run: uv run pytest tests/test_integration.py -v
@@ -77,4 +85,9 @@ jobs:
       - name: Stop server (Windows)
         if: always() && runner.os == 'Windows'
         shell: pwsh
-        run: Stop-Process -Id (Get-Content server.pid) -Force
+        run: |
+          python -c "
+          import os, signal
+          pid = int(open('server.pid').read())
+          os.kill(pid, signal.SIGTERM)
+          "
