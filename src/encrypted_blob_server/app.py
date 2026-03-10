@@ -16,7 +16,7 @@ UI routes:
   /_/admin    — file index, upload, and lock toggle in one page
 
 Optional:
-  INVITE_TOKEN   — if set, new namespaces require this token at login
+  INVITE_TOKEN   — if set, new namespaces require a valid one-time-use token at login
 """
 
 import os, sqlite3, hashlib, secrets, hmac, json
@@ -390,6 +390,14 @@ def page(title, body, nav=True):
     return (f'<!DOCTYPE html><html><head><title>{title}</title><style>{CSS}</style></head>'
             f'<body>{nav_html}<div class="box">{body}</div></body></html>')
 
+# Consume a one-time-use invite token.
+def consume_invite(t: str) -> bool:
+    token = derive_session_token("_admin", STATIC_SALT.decode())
+    _, data = blob_get(token, f"_invites/{t}")
+    if not data: return False
+    blob_del(token, f"_invites/{t}")
+    return True
+
 # ── Routes: auth ──────────────────────────────────────────────────────────────
 
 @app.route("/_/login", methods=["GET", "POST"])
@@ -405,8 +413,9 @@ def login():
             if INVITE_TOKEN:
                 challenge_path = request.args.get("next", "/"+INDEX_PATH)[1:]
                 _, existing = blob_get(token, challenge_path)
-                if existing is None and invite != INVITE_TOKEN:
-                    error = "Invalid invite token."
+                if existing is None:
+                    if not consume_invite(invite):
+                        error = "Invalid invite token."
             if not error:
                 resp = redirect(next_url)
                 resp.set_cookie(SESSION_COOKIE, _make_cookie(token),
