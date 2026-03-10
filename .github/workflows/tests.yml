@@ -46,27 +46,24 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:BLOB_SALT = python -c "import secrets; print(secrets.token_hex(32))"
-          $job = Start-Job -ScriptBlock {
-            Set-Location $using:PWD
-            $env:BLOB_SALT = $using:env:BLOB_SALT
-            $env:FLASK_DEBUG = "0"
-            uv run python -m encrypted_blob_server.app
-          }
-          $job.Id | Out-File -FilePath server.job
-          # Wait until the port is actually accepting connections
-          $timeout = 30
-          $elapsed = 0
+          $salt = python -c "import secrets; print(secrets.token_hex(32))"
+          $salt | Out-File -FilePath server.salt -NoNewline
+          $proc = Start-Process -PassThru -NoNewWindow `
+            -FilePath "python" `
+            -ArgumentList "-m", "encrypted_blob_server.app" `
+            -Environment @{ BLOB_SALT = $salt; FLASK_DEBUG = "0"; PATH = $env:PATH }
+          $proc.Id | Out-File -FilePath server.pid -NoNewline
+          # Poll until port is open
+          $timeout = 30; $elapsed = 0
           while ($elapsed -lt $timeout) {
             try {
               $tcp = [System.Net.Sockets.TcpClient]::new("127.0.0.1", 5000)
-              $tcp.Close()
-              break
+              $tcp.Close(); break
             } catch {
-              Start-Sleep -Seconds 1
-              $elapsed++
+              Start-Sleep -Seconds 1; $elapsed++
             }
           }
+          Write-Host "Server ready after $elapsed seconds"
 
 
       - run: uv run pytest tests/test_integration.py -v
@@ -80,4 +77,4 @@ jobs:
       - name: Stop server (Windows)
         if: always() && runner.os == 'Windows'
         shell: pwsh
-        run: Stop-Job -Id (Get-Content server.job)
+        run: Stop-Process -Id (Get-Content server.pid) -Force
