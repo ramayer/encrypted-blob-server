@@ -47,12 +47,27 @@ jobs:
         shell: pwsh
         run: |
           $env:BLOB_SALT = python -c "import secrets; print(secrets.token_hex(32))"
-          $env:FLASK_DEBUG = "0"
-          $proc = Start-Process -PassThru -NoNewWindow `
-            -FilePath "uv" `
-            -ArgumentList "run", "python", "-m", "encrypted_blob_server.app"
-          $proc.Id | Out-File -FilePath server.pid
-          Start-Sleep -Seconds 3
+          $job = Start-Job -ScriptBlock {
+            Set-Location $using:PWD
+            $env:BLOB_SALT = $using:env:BLOB_SALT
+            $env:FLASK_DEBUG = "0"
+            uv run python -m encrypted_blob_server.app
+          }
+          $job.Id | Out-File -FilePath server.job
+          # Wait until the port is actually accepting connections
+          $timeout = 30
+          $elapsed = 0
+          while ($elapsed -lt $timeout) {
+            try {
+              $tcp = [System.Net.Sockets.TcpClient]::new("127.0.0.1", 5000)
+              $tcp.Close()
+              break
+            } catch {
+              Start-Sleep -Seconds 1
+              $elapsed++
+            }
+          }
+
 
       - run: uv run pytest tests/test_integration.py -v
         env:
@@ -65,7 +80,4 @@ jobs:
       - name: Stop server (Windows)
         if: always() && runner.os == 'Windows'
         shell: pwsh
-        run: |
-          Get-NetTCPConnection -LocalPort 5000 -State Listen |
-            Select-Object -ExpandProperty OwningProcess |
-            ForEach-Object { Stop-Process -Id $_ -Force }
+        run: Stop-Job -Id (Get-Content server.job)
