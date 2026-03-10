@@ -36,6 +36,7 @@ jobs:
       - name: Start server (unix)
         if: runner.os != 'Windows'
         run: |
+          FLASK_DEBUG=0 \
           BLOB_SALT=$(python -c "import secrets; print(secrets.token_hex(32))") \
           uv run python -m encrypted_blob_server.app &
           echo $! > server.pid
@@ -46,6 +47,7 @@ jobs:
         shell: pwsh
         run: |
           $env:BLOB_SALT = python -c "import secrets; print(secrets.token_hex(32))"
+          $env:FLASK_DEBUG = "0"
           $proc = Start-Process -PassThru -NoNewWindow `
             -FilePath "uv" `
             -ArgumentList "run", "python", "-m", "encrypted_blob_server.app"

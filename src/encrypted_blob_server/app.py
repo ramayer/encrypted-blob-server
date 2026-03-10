@@ -607,7 +607,7 @@ def main():
     print("Encrypted Blob Storage  —  http://localhost:5000/_/admin")
     if INVITE_TOKEN:
         print(f"Invite token required for new namespaces: {INVITE_TOKEN}")
-    app.run(host="0.0.0.0", port=5000, debug=True)
-
+    app.run(host="0.0.0.0", port=5000, debug=os.environ.get("FLASK_DEBUG", "1") != "0")
+    
 if __name__ == "__main__":
     main()
