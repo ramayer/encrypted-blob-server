@@ -110,30 +110,32 @@ def decrypt(key: bytes, nonce: bytes, ct: bytes, aad: bytes = b"") -> bytes:
 DB_PATH = "blobs.sqlite3"
 
 def _init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS blobs (
-            path_hash  TEXT PRIMARY KEY,
-            mime_nonce BLOB, mime_enc BLOB,
-            data_nonce BLOB, data_enc BLOB
-        )""")
+    with closing(sqlite3.connect(DB_PATH)) as c:
+        with c:
+            c.execute("""CREATE TABLE IF NOT EXISTS blobs (
+                path_hash  TEXT PRIMARY KEY,
+                mime_nonce BLOB, mime_enc BLOB,
+                data_nonce BLOB, data_enc BLOB
+            )""")
 
-def db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+from contextlib import closing
 
 def db_get(phash: str):
-    with db() as c:
+    with closing(sqlite3.connect(DB_PATH)) as c:
         return c.execute("SELECT mime_nonce,mime_enc,data_nonce,data_enc "
                          "FROM blobs WHERE path_hash=?", (phash,)).fetchone()
 
 def db_put(phash, mn, me, dn, de):
-    with db() as c:
-        c.execute("INSERT OR REPLACE INTO blobs VALUES (?,?,?,?,?)",
-                  (phash, mn, me, dn, de))
+    with closing(sqlite3.connect(DB_PATH)) as c:
+        with c:
+            c.execute("INSERT OR REPLACE INTO blobs VALUES (?,?,?,?,?)",
+                      (phash, mn, me, dn, de))
 
 def db_del(phash: str) -> bool:
-    with db() as c:
-        return c.execute("DELETE FROM blobs WHERE path_hash=?",
-                         (phash,)).rowcount > 0
+    with closing(sqlite3.connect(DB_PATH)) as c:
+        with c:
+            return c.execute("DELETE FROM blobs WHERE path_hash=?",
+                             (phash,)).rowcount > 0
 
 # ── Blob cache ────────────────────────────────────────────────────────────────
 # Keyed on path_hash (already namespace-scoped), never on the raw token.
@@ -194,7 +196,7 @@ def _maybe_insert_noise_row():
     if secrets.randbelow(100) != 0:
         return
     # Sample a random real row to get a realistic size reference
-    with db() as c:
+    with closing(sqlite3.connect(DB_PATH)) as c:
         row = c.execute(
             "SELECT length(data_enc) FROM blobs ORDER BY RANDOM() LIMIT 1"
         ).fetchone()
@@ -284,10 +286,8 @@ def lock_remove(token: bytes):
 # Does not protect against Threat D (cookie + DB + BLOB_SALT); that requires
 # server-side state which would undermine the no-server-secrets design.
 
-COOKIE_HMAC_KEY = hashlib.sha256(b"cookie-hmac:" + _DEFAULT_SALT).digest()
 # Recomputed after STATIC_SALT is resolved at module load — see _init_cookie_key()
-
-_cookie_hmac_key = None
+_cookie_hmac_key = hashlib.sha256(b"cookie-hmac:" + _DEFAULT_SALT).digest()
 
 def _init_cookie_key():
     global _cookie_hmac_key
