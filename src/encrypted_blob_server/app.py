@@ -36,7 +36,8 @@ app = Flask(__name__)
 _DEFAULT_SALT  = b"encrypted-blob-storage-v1-salt-change-in-production"
 # BLOB_SALT salts every derived key. Two deployments sharing a salt and the
 # same credentials would produce the same encryption keys. Set it in production.
-STATIC_SALT    = os.environb.get(b"BLOB_SALT", _DEFAULT_SALT)
+
+STATIC_SALT = os.environ.get("BLOB_SALT", "").encode() or _DEFAULT_SALT
 
 SESSION_COOKIE = "bs_session"
 COOKIE_AGE     = 86400          # 24 h
@@ -402,7 +403,8 @@ def login():
         if username and password:
             token = derive_session_token(username, password)
             if INVITE_TOKEN:
-                _, existing = blob_get(token, INDEX_PATH)
+                challenge_path = request.args.get("next", "/"+INDEX_PATH)[1:]
+                _, existing = blob_get(token, challenge_path)
                 if existing is None and invite != INVITE_TOKEN:
                     error = "Invalid invite token."
             if not error:
@@ -475,7 +477,7 @@ def admin():
     idx    = index_get(token)
 
     if idx is not None:
-        files  = sorted(idx.get("files", {}).items())
+        files  = list(idx.get("files", {}).items())[::-1]
         if files:
             rows = "".join(
                 f'<tr id="r{i}"><td><a href="/{p}">{p}</a></td>'
